@@ -101,6 +101,7 @@ export class AvitoAuthService {
         this.logger.log(
           `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
         );
+        await this.captureDebug(page, `session-probe-${authorized ? 'authorized' : 'anon'}`);
         if (authorized) {
           this.setState('authorized', 'Session restored');
           return page;
@@ -120,6 +121,10 @@ export class AvitoAuthService {
         const authorizedAfterLogin = await this.isAuthorized(page);
         this.logger.log(
           `Post-login probe: ${authorizedAfterLogin ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → will retry'}`,
+        );
+        await this.captureDebug(
+          page,
+          `post-login-probe-${authorizedAfterLogin ? 'authorized' : 'anon'}`,
         );
         if (authorizedAfterLogin) {
           this.setState('authorized', 'Logged in');
@@ -201,6 +206,7 @@ export class AvitoAuthService {
     );
     await loginInput.click({ clickCount: 3 });
     await loginInput.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
+    await this.captureDebug(page, 'login-filled');
 
     this.logger.log('Filling password input');
     const passwordInput = await this.waitForSelectorAny(
@@ -210,6 +216,7 @@ export class AvitoAuthService {
     );
     await passwordInput.click({ clickCount: 3 });
     await passwordInput.type(this.config.avitoPassword, { delay: TIMEOUTS_MS.typingKeystroke });
+    await this.captureDebug(page, 'password-filled');
 
     // Race two events for the next 60s — register BOTH before clicking submit,
     // otherwise an immediate redirect can fire before we attach the listener.
@@ -227,9 +234,11 @@ export class AvitoAuthService {
 
     this.logger.log('Submitting credentials, racing navigation vs 2FA prompt…');
     await this.tryClickSubmit(page);
+    await this.captureDebug(page, 'after-credentials-submit');
 
     const outcome = await Promise.race([navPromise, codePromise]);
     if (outcome === null) {
+      await this.captureDebug(page, 'login-outcome-timeout');
       throw new Error('Login did not complete within 60s: neither redirect nor 2FA prompt');
     }
     this.logger.log(
@@ -237,6 +246,7 @@ export class AvitoAuthService {
         ? 'Login outcome: navigation → credentials accepted, no 2FA'
         : 'Login outcome: 2FA prompt rendered',
     );
+    await this.captureDebug(page, `login-outcome-${outcome === 'redirected' ? 'redirected' : '2fa'}`);
 
     if (outcome === '2fa') {
       this.logger.log('Emitting auth.needs_code, awaiting POST /auth/code from frontend');
@@ -251,6 +261,7 @@ export class AvitoAuthService {
       );
       await codeInput.click({ clickCount: 3 });
       await codeInput.type(code, { delay: TIMEOUTS_MS.typingKeystroke });
+      await this.captureDebug(page, 'code-filled');
 
       // Only success criterion after 2FA submit is a real navigation. Same
       // registration-before-click rule as above.
@@ -264,11 +275,14 @@ export class AvitoAuthService {
 
       this.logger.log('Submitting 2FA code, waiting for navigation…');
       await this.tryClickSubmit(page);
+      await this.captureDebug(page, 'after-code-submit');
 
       if (!(await navAfterCode)) {
+        await this.captureDebug(page, 'post-2fa-timeout');
         throw new Error('2FA did not complete within 60s: no redirect after code submit');
       }
       this.logger.log('2FA navigation landed — Avito accepted the code');
+      await this.captureDebug(page, 'post-2fa-success');
       // Real confirmation that Avito accepted the code, not just the user
       // submitting it to us. Emit only after the post-2FA navigation lands.
       this.events.emit('auth.code_accepted');
