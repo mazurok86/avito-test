@@ -10,6 +10,18 @@ import type { AuthState, StatusChange } from './avito.types';
 
 const DEBUG_DIR = './debug-screenshots';
 
+// Avito serves a "доступ ограничен" interstitial when rate-limiting or
+// IP-blocking — retrying the same flow won't unblock us, so we surface this
+// as a typed error and bail out of the retry loop.
+const BLOCKED_TITLE_MARKER = 'Доступ ограничен';
+
+class AvitoAccessBlockedError extends Error {
+  constructor(detail: string) {
+    super(`Avito access blocked: ${detail}`);
+    this.name = 'AvitoAccessBlockedError';
+  }
+}
+
 const AVITO_PROFILE_URL = 'https://www.avito.ru/profile/messenger';
 const AVITO_LOGIN_URL = 'https://www.avito.ru/#login';
 
@@ -118,6 +130,15 @@ export class AvitoAuthService {
         // clients. The final state is set by the caller via the throw below.
         lastError = (err as Error).message;
         this.logger.warn(`Login attempt ${attempt} failed: ${lastError}`);
+
+        // Avito-side block (rate-limit / IP-ban) — retrying the same flow
+        // from the same IP won't unblock us. Bail out immediately so the
+        // operator sees the real cause instead of waiting through all retries.
+        if (err instanceof AvitoAccessBlockedError) {
+          this.logger.error('Aborting retry loop: Avito blocked access');
+          throw err;
+        }
+
         const backoff = TIMEOUTS_MS.retryBackoffBase * attempt;
         this.logger.log(`Backing off ${backoff}ms before next attempt`);
         await this.sleep(backoff);
@@ -322,7 +343,15 @@ export class AvitoAuthService {
         frameNavs.forEach((u, i) => this.logger.log(`[nav:${label}]   [${i}] ${u}`));
       }
 
-      this.logger.log(`[nav:${label}] final URL = ${page.url()}`);
+      const finalUrl = page.url();
+      const title = await page.title().catch(() => '');
+      this.logger.log(`[nav:${label}] final URL = ${finalUrl}`);
+      this.logger.log(`[nav:${label}] page title = "${title}"`);
+
+      if (title.includes(BLOCKED_TITLE_MARKER)) {
+        await this.captureDebug(page, `${label}-blocked`);
+        throw new AvitoAccessBlockedError(`title="${title}", url=${finalUrl}`);
+      }
     } finally {
       page.off('framenavigated', onNav);
     }
