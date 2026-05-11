@@ -1,10 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Page } from 'puppeteer';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
 import { AppConfigService } from '../../config/config.service';
 import { BrowserService } from './browser.service';
 import type { AuthState, StatusChange } from './avito.types';
+
+const DEBUG_DIR = './debug-screenshots';
 
 const AVITO_PROFILE_URL = 'https://www.avito.ru/profile/messenger';
 const AVITO_LOGIN_URL = 'https://www.avito.ru/#login';
@@ -152,12 +156,19 @@ export class AvitoAuthService {
       timeout: TIMEOUTS_MS.pageNavigation,
     });
     this.logger.log('Login page hydrated, waiting for login form…');
+    await this.captureDebug(page, 'after-login-page-load');
 
-    await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
+    try {
+      await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
+    } catch (err) {
+      await this.captureDebug(page, 'login-form-timeout');
+      throw err;
+    }
     this.logger.log(
       `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms before filling inputs`,
     );
     await this.sleep(TIMEOUTS_MS.loginFormSettle);
+    await this.captureDebug(page, 'after-settle');
     this.logger.log('Filling login input');
     const loginInput = await this.waitForSelectorAny(
       page,
@@ -262,6 +273,31 @@ export class AvitoAuthService {
     const handle = await page.waitForSelector(selector, { timeout });
     if (!handle) throw new Error(`Selector not found: ${selector}`);
     return handle;
+  }
+
+  /**
+   * Dumps a full-page screenshot + HTML snapshot + current URL/title for
+   * post-mortem debugging. Files go into ./debug-screenshots/<ts>-<label>.{png,html}.
+   * Safe to call on any page state — all errors are swallowed.
+   */
+  private async captureDebug(page: Page, label: string): Promise<void> {
+    try {
+      await mkdir(resolve(DEBUG_DIR), { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const safeLabel = label.replace(/[^a-z0-9-]+/gi, '_');
+      const base = resolve(DEBUG_DIR, `${stamp}-${safeLabel}`);
+
+      const url = page.url();
+      const title = await page.title().catch(() => '<title unavailable>');
+      this.logger.log(`[DEBUG] capture "${label}": url=${url} title=${title}`);
+
+      await page.screenshot({ path: `${base}.png` as `${string}.png`, fullPage: true });
+      const html = await page.content();
+      await writeFile(`${base}.html`, html, 'utf8');
+      this.logger.log(`[DEBUG] capture "${label}" → ${base}.{png,html}`);
+    } catch (err) {
+      this.logger.warn(`[DEBUG] capture "${label}" failed: ${(err as Error).message}`);
+    }
   }
 
   private async isAuthorized(page: Page): Promise<boolean> {
