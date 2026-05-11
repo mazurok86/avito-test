@@ -38,9 +38,10 @@ const SELECTORS = {
   submitButton: 'form[data-marker="login-form"] button[data-marker="login-form/submit"]',
   codeInput:
     '[data-marker="code-form/code/input"], [data-marker="code/input"], input[name="code"], input[name="codeConfirm"], input[autocomplete="one-time-code"]',
-  // Coupled with ChatWatcherService.CHANNELS_LIST_SELECTOR. Used as the
-  // positive signal that we're on the messenger AND logged in.
-  channelsList: '[data-marker="channels/list"]',
+  // Profile menu in the site header. Present on any Avito page only when a
+  // user session is active — independent of which path we landed on, so
+  // it's a clean session indicator.
+  headerMenuProfile: '[data-marker="header/menu-profile"]',
 };
 
 type CodeResolver = (code: string) => void;
@@ -76,7 +77,7 @@ export class AvitoAuthService {
         });
         const authorized = await this.isAuthorized(page);
         this.logger.log(
-          `Session probe: ${authorized ? 'channels/list found → authorized' : 'channels/list missing → need login'}`,
+          `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
         );
         if (authorized) {
           this.setState('authorized', 'Session restored');
@@ -96,7 +97,7 @@ export class AvitoAuthService {
         this.logger.log('Re-probing session after login…');
         const authorizedAfterLogin = await this.isAuthorized(page);
         this.logger.log(
-          `Post-login probe: ${authorizedAfterLogin ? 'channels/list found → authorized' : 'channels/list missing → will retry'}`,
+          `Post-login probe: ${authorizedAfterLogin ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → will retry'}`,
         );
         if (authorizedAfterLogin) {
           this.setState('authorized', 'Logged in');
@@ -257,8 +258,14 @@ export class AvitoAuthService {
   }
 
   private async isAuthorized(page: Page): Promise<boolean> {
+    // header/menu-profile is rendered on any Avito page that has an active
+    // session. Querying via page.evaluate returns a primitive boolean — no
+    // ElementHandle, no DOM.resolveNode races during in-flight navigation.
     return page
-      .evaluate((sel: string) => document.querySelector(sel) !== null, SELECTORS.channelsList)
+      .evaluate(
+        (sel: string) => document.querySelector(sel) !== null,
+        SELECTORS.headerMenuProfile,
+      )
       .catch(() => false);
   }
 
