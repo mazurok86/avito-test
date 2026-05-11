@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>Avito Messenger Relay</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Avito Messenger Relay</h1>
+      <div class="status-row">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-text">connecting…</span>
+        <span id="status-detail" class="muted"></span>
+      </div>
+    </header>
+
+    <section id="auth-panel" class="auth-panel hidden">
+      <p>Avito requested a 2FA code: <span id="auth-reason"></span></p>
+      <form id="auth-form">
+        <input id="auth-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required />
+        <button type="submit">Submit code</button>
+      </form>
+      <p id="auth-feedback" class="muted"></p>
+    </section>
+
+    <main>
+      <ul id="messages" class="messages"></ul>
+      <p id="empty-state" class="muted">Waiting for new messages…</p>
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

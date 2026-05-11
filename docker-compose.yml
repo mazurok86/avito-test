@@ -1,0 +1,20 @@
+services:
+  avito-relay:
+    build: .
+    image: avito-relay
+    container_name: avito-relay
+    init: true
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      PUPPETEER_HEADLESS: "true"
+      PUPPETEER_USER_DATA_DIR: /app/.chrome-profile
+      PUPPETEER_EXECUTABLE_PATH: ""
+    volumes:
+      - chrome-profile:/app/.chrome-profile
+    restart: unless-stopped
+
+volumes:
+  chrome-profile:
