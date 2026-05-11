@@ -20,6 +20,10 @@ const TIMEOUTS_MS = {
   inputAppear: 5000,
   /** Per-keystroke delay during type() — mimics human input. */
   typingKeystroke: 40,
+  /** Settle pause after the login form first appears, before we start typing.
+   *  Avito's SPA can keep re-rendering the form right after it mounts; touching
+   *  inputs too early causes handle/document races. */
+  loginFormSettle: 10000,
   /** Race window after credentials submit: "redirect happened" vs "2FA prompt rendered". */
   loginOutcome: 60000,
   /** Wait for the post-2FA-submit redirect to land. */
@@ -139,19 +143,22 @@ export class AvitoAuthService {
       throw new Error('AVITO_LOGIN/AVITO_PASSWORD are not set');
     }
 
-    // networkidle2 (vs. domcontentloaded) waits for the SPA to actually
-    // hydrate — bundles fetched, login-modal JS executed, XHRs settled.
-    // Otherwise the next waitForSelector(loginForm) ends up doing all the
-    // waiting itself.
-    this.logger.log(`Navigating to login page (${AVITO_LOGIN_URL}, waitUntil=networkidle2)`);
+    // 'load' (vs. domcontentloaded) waits for all blocking subresources —
+    // bundles, CSS, async scripts — so the login modal has its JS available
+    // by the time we start hunting for the form selector.
+    this.logger.log(`Navigating to login page (${AVITO_LOGIN_URL}, waitUntil=load)`);
     await page.goto(AVITO_LOGIN_URL, {
-      waitUntil: 'networkidle2',
+      waitUntil: 'load',
       timeout: TIMEOUTS_MS.pageNavigation,
     });
     this.logger.log('Login page hydrated, waiting for login form…');
 
     await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
-    this.logger.log('Login form visible, filling login input');
+    this.logger.log(
+      `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms before filling inputs`,
+    );
+    await this.sleep(TIMEOUTS_MS.loginFormSettle);
+    this.logger.log('Filling login input');
     const loginInput = await this.waitForSelectorAny(
       page,
       SELECTORS.loginInput,
