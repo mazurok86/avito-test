@@ -4,7 +4,7 @@ import { OnEvent } from '@nestjs/event-emitter';
 import type { AuthCodeRequest, StatusChange } from '../avito/avito.types';
 
 export interface StatusSnapshot {
-  status: StatusChange | null;
+  status: StatusChange;
   awaitingCode: AuthCodeRequest | null;
 }
 
@@ -18,7 +18,9 @@ export interface StatusSnapshot {
  */
 @Injectable()
 export class StatusService {
-  private status: StatusChange | null = null;
+  // Initial snapshot: nothing has started yet. Clients that connect before
+  // the auth flow kicks off get a meaningful state instead of null.
+  private status: StatusChange = { state: 'idle', at: new Date().toISOString() };
   private awaitingCode: AuthCodeRequest | null = null;
 
   @OnEvent('status.change')

@@ -23,7 +23,7 @@ export class MessagesGateway implements OnGatewayConnection, OnGatewayDisconnect
   handleConnection(client: Socket): void {
     this.logger.log(`Client connected: ${client.id}`);
     const snapshot = this.status.getSnapshot();
-    if (snapshot.status) client.emit('status:change', snapshot.status);
+    client.emit('status:change', snapshot.status);
     if (snapshot.awaitingCode) client.emit('auth:needs_code', snapshot.awaitingCode);
   }
 

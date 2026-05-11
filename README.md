@@ -40,9 +40,24 @@ Nest.js сервис, который через Puppeteer входит в Лич
 - **Сессия через `userDataDir`** — Chromium хранит куки в `./.chrome-profile`,
   повторные запуски не требуют логина и снижают шанс CAPTCHA.
 - **Гибридная авторизация** — если сессия не валидна, сервис логинится из
-  `.env`. На запрос 2FA/SMS выпускается событие `auth:needs_code`; фронт
-  показывает форму, шлёт код в `POST /auth/code`, сервис вводит его в
-  Puppeteer и продолжает.
+  `.env`. Проверка сессии делается одним снимком DOM на `/profile/messenger`:
+  есть `[data-marker="channels/list"]` → авторизованы (страница server-rendered,
+  селектор лежит в HTML сразу после `DOMContentLoaded`). Если нет — старая
+  Page закрывается и для логина открывается свежий таб через `browser.newPage()`
+  (куки живут в `userDataDir` на уровне браузер-контекста, не на странице).
+  Это убирает гонку с клиент-сайдным редиректом Avito на `/#login` и
+  выкидывает stale SPA-стейт.
+- **Детект исхода логина — по событиям, не по URL** — после сабмита формы
+  гонка из двух промисов, зарегистрированных **до** клика: `waitForNavigation`
+  (любой реальный cross-document переход → success) и
+  `waitForSelector(codeInput)` (модалка 2FA → переходим в ветку с вводом
+  кода). Если за 60с ни одно — `error`. Аналогично после ввода 2FA: успех =
+  факт навигации. Никаких эвристик по `location.pathname` —
+  страница SPA, путь может выглядеть «успешно» и без реального перехода.
+- **Семантика `auth:code_accepted`** — событие летит фронту **только после**
+  того, как Avito приняла код (post-2FA `waitForNavigation` отстрелял). HTTP
+  `POST /auth/code` возвращает `{ received: true }` сразу, но это лишь «код
+  получили» — реальное подтверждение приходит отдельным WS-событием.
 - **Получение сообщений через CDP** — слушаем `Network.webSocketFrameReceived`
   от `wss://socket.avito.ru` и парсим фреймы с дискриминатором `type === "Message"`.
   Парсер изолирован в `message-frame.parser.ts` и строго валидирует контракт
@@ -104,15 +119,17 @@ client/
 | ------------------- | ----------- | -------------------------------------------------------------------------------- |
 | `status:change`     | server→client | `{ state, detail?, at }` где `state ∈ idle / starting / logging_in / awaiting_code / authorized / error` |
 | `auth:needs_code`   | server→client | `{ reason, at }` — Авито запросил 2FA                                            |
-| `auth:code_accepted`| server→client | `{ at }` — код принят сервером.                                                  |
+| `auth:code_accepted`| server→client | `{ at }` — Avito подтвердила код (произошла навигация после ввода 2FA).          |
 | `message:new`       | server→client | `{ id, chatId, authorName, text, createdAt, receivedAt }`                        |
 
 REST:
 
-- `POST /auth/code` принимает `{ "code": "123456" }` и передаёт его в
-  Puppeteer (если в данный момент ожидается 2FA).
+- `POST /auth/code` принимает `{ "code": "123456" }`. В ответе `{ received: boolean }`
+  — это «код доставлен в Puppeteer», а не «Avito приняла». Подтверждение приёма
+  приходит отдельным WS-событием `auth:code_accepted`. `400`, если в данный
+  момент 2FA не запрошена.
 - `GET /status` отдаёт snapshot `{ status, awaitingCode }` — тот же, что
-  gateway шлёт новым клиентам.
+  gateway шлёт новым клиентам. До старта авторизации `status.state = 'idle'`.
 
 ## Запуск (локально)
 
@@ -178,11 +195,55 @@ docker compose up --build
 > = чистая сессия: сервис залогинится из `.env`, 2FA-код введёшь в форме
 > на `localhost:3000`. Дальше — сессия осядет в volume.
 
+## Публикация через CloudPub
+
+Чтобы поделиться демо без публичного IP, поднимаем туннель `clo` (CloudPub)
+рядом с запущенным сервисом на `localhost:3000`.
+
+### 1. Регистрация
+
+1. Откройте <https://cloudpub.ru> и зарегистрируйтесь (email + пароль).
+2. В личном кабинете → раздел «Установка» → скопируйте токен.
+
+### 2. Установка (Linux x86_64, Ubuntu/Debian)
+
+```bash
+# Скачать актуальную версию
+wget https://cloudpub.ru/download/stable/clo-3.0.1-stable-linux-x86_64.tar.gz
+
+# Распаковать
+tar -xzf clo-3.0.1-stable-linux-x86_64.tar.gz
+
+# Установить в систему
+sudo install -m 755 clo /usr/local/bin/clo
+
+# Проверить
+clo --version
+```
+
+### 3. Привязка токена
+
+```bash
+clo set token <ВАШ_ТОКЕН>
+```
+
+Токен сохраняется в `~/.cloudpub/` и подхватывается автоматически.
+
+### 4. Публикация сервиса
+
+```bash
+clo publish http 3000
+```
+
+В выводе появится публичный URL вида `https://xxxxx.cloudpub.ru` — открывайте
+его в браузере с любого устройства, фронт и WebSocket работают как с
+`localhost:3000`.
+
 ## Обработка ошибок
 
 | Сценарий                          | Поведение сервиса                                                                                                          |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Неверный пароль / нет 2FA-кода    | До `AUTH_MAX_ATTEMPTS` попыток с backoff, дальше `status:error`.                                                           |
+| Неверный пароль / нет 2FA-кода    | До `AUTH_MAX_ATTEMPTS` попыток с backoff. Между попытками `state` остаётся `logging_in` (без мерцания на `error`), причина последней неудачи попадает в `detail` финального `status:error`. |
 | Disconnect Chromium               | `BrowserService` подхватит на следующем запросе и перезапустится.                                                          |
 | Контракт Avito сломался (DOM / WS)| Watcher вызывает `halt()`, эмитит `status.change` с `state=error` и причиной в `detail`. Нужен перезапуск после починки.   |
 | WS-стрим встал (нет фреймов 90с+) | Health-monitor вызывает `halt()` с `WS stalled: …` — поднимается тем же путём, что и другие halt-причины.                  |
