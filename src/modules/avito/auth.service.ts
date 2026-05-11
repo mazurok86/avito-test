@@ -13,7 +13,7 @@ const AVITO_LOGIN_URL = 'https://www.avito.ru/#login';
 // Tunable from one place so the intent of each timer is named.
 const TIMEOUTS_MS = {
   /** Max wait for any page.goto() during the auth flow. */
-  pageNavigation: 60000,
+  pageNavigation: 180000,
   /** Max wait for the login modal to mount after navigating to AVITO_LOGIN_URL. */
   loginFormAppear: 60000,
   /** Max wait for input fields (login/password/code) once the form is on screen. */
