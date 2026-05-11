@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import type { Page } from 'puppeteer';
+import type { Frame, Page, WaitForOptions } from 'puppeteer';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
@@ -79,10 +79,12 @@ export class AvitoAuthService {
       attempt += 1;
       try {
         this.logger.log(`Attempt ${attempt}/${this.config.authMaxAttempts}: probing session…`);
-        await page.goto(AVITO_PROFILE_URL, {
-          waitUntil: 'domcontentloaded',
-          timeout: TIMEOUTS_MS.pageNavigation,
-        });
+        await this.gotoWithChain(
+          page,
+          AVITO_PROFILE_URL,
+          { waitUntil: 'domcontentloaded', timeout: TIMEOUTS_MS.pageNavigation },
+          'session-probe',
+        );
         const authorized = await this.isAuthorized(page);
         this.logger.log(
           `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
@@ -150,11 +152,12 @@ export class AvitoAuthService {
     // 'load' (vs. domcontentloaded) waits for all blocking subresources —
     // bundles, CSS, async scripts — so the login modal has its JS available
     // by the time we start hunting for the form selector.
-    this.logger.log(`Navigating to login page (${AVITO_LOGIN_URL}, waitUntil=load)`);
-    await page.goto(AVITO_LOGIN_URL, {
-      waitUntil: 'load',
-      timeout: TIMEOUTS_MS.pageNavigation,
-    });
+    await this.gotoWithChain(
+      page,
+      AVITO_LOGIN_URL,
+      { waitUntil: 'load', timeout: TIMEOUTS_MS.pageNavigation },
+      'login-page',
+    );
     this.logger.log('Login page hydrated, waiting for login form…');
     await this.captureDebug(page, 'after-login-page-load');
 
@@ -251,13 +254,14 @@ export class AvitoAuthService {
     }
 
     // Land on the messenger so the watcher has the right page to observe.
-    this.logger.log(`Landing on messenger (${AVITO_PROFILE_URL})`);
-    await page
-      .goto(AVITO_PROFILE_URL, {
-        waitUntil: 'domcontentloaded',
-        timeout: TIMEOUTS_MS.pageNavigation,
-      })
-      .catch(() => undefined);
+    await this.gotoWithChain(
+      page,
+      AVITO_PROFILE_URL,
+      { waitUntil: 'domcontentloaded', timeout: TIMEOUTS_MS.pageNavigation },
+      'messenger-landing',
+    ).catch((err) => {
+      this.logger.warn(`Final landing navigation failed: ${(err as Error).message}`);
+    });
   }
 
   private async tryClickSubmit(page: Page): Promise<void> {
@@ -273,6 +277,55 @@ export class AvitoAuthService {
     const handle = await page.waitForSelector(selector, { timeout });
     if (!handle) throw new Error(`Selector not found: ${selector}`);
     return handle;
+  }
+
+  /**
+   * Wraps page.goto with full visibility into the navigation:
+   *   - HTTP redirect chain via response.request().redirectChain() (server-side 3xx);
+   *   - main-frame navigations during the goto window (client-side location.replace,
+   *     history.pushState, hash routes — anything that doesn't show as HTTP redirect);
+   *   - final landing URL.
+   * Returns whatever page.goto would return.
+   */
+  private async gotoWithChain(
+    page: Page,
+    url: string,
+    opts: WaitForOptions & { timeout?: number },
+    label: string,
+  ): Promise<void> {
+    const frameNavs: string[] = [];
+    const mainFrame = page.mainFrame();
+    const onNav = (frame: Frame): void => {
+      if (frame === mainFrame) frameNavs.push(frame.url());
+    };
+    page.on('framenavigated', onNav);
+
+    try {
+      this.logger.log(`[nav:${label}] target = ${url}`);
+      const response = await page.goto(url, opts);
+
+      const httpChain = response
+        ? [...response.request().redirectChain().map((r) => r.url()), response.url()]
+        : [];
+
+      if (httpChain.length > 1) {
+        this.logger.log(`[nav:${label}] HTTP redirect chain (${httpChain.length} hops):`);
+        httpChain.forEach((u, i) => this.logger.log(`[nav:${label}]   [${i}] ${u}`));
+      } else if (httpChain.length === 1) {
+        this.logger.log(`[nav:${label}] no HTTP redirects (200 from ${httpChain[0]})`);
+      } else {
+        this.logger.log(`[nav:${label}] no HTTP response (likely same-document nav)`);
+      }
+
+      if (frameNavs.length > 0) {
+        this.logger.log(`[nav:${label}] main-frame navigations during goto (${frameNavs.length}):`);
+        frameNavs.forEach((u, i) => this.logger.log(`[nav:${label}]   [${i}] ${u}`));
+      }
+
+      this.logger.log(`[nav:${label}] final URL = ${page.url()}`);
+    } finally {
+      page.off('framenavigated', onNav);
+    }
   }
 
   /**
