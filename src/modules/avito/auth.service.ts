@@ -9,6 +9,27 @@ import type { AuthState, StatusChange } from './avito.types';
 const AVITO_PROFILE_URL = 'https://www.avito.ru/profile/messenger';
 const AVITO_LOGIN_URL = 'https://www.avito.ru/#login';
 
+// All wait windows and fixed delays in the auth flow, in milliseconds.
+// Tunable from one place so the intent of each timer is named.
+const TIMEOUTS_MS = {
+  /** Max wait for any page.goto() during the auth flow. */
+  pageNavigation: 60000,
+  /** Max wait for the login modal to mount after navigating to AVITO_LOGIN_URL. */
+  loginFormAppear: 60000,
+  /** Max wait for input fields (login/password/code) once the form is on screen. */
+  inputAppear: 5000,
+  /** Per-keystroke delay during type() — mimics human input. */
+  typingKeystroke: 40,
+  /** Race window after credentials submit: "redirect happened" vs "2FA prompt rendered". */
+  loginOutcome: 60000,
+  /** Wait for the post-2FA-submit redirect to land. */
+  twoFactorRedirect: 60000,
+  /** How long the service waits for the user to deliver a 2FA code via POST /auth/code. */
+  twoFactorCodeWait: 5 * 60000,
+  /** Base for linear backoff between retries (multiplied by attempt number). */
+  retryBackoffBase: 2000,
+};
+
 // Login is rendered as a modal on top of the home page (#login hash).
 const SELECTORS = {
   loginForm: 'form[data-marker="login-form"]',
@@ -45,7 +66,10 @@ export class AvitoAuthService {
     while (attempt < this.config.authMaxAttempts) {
       attempt += 1;
       try {
-        await page.goto(AVITO_PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.goto(AVITO_PROFILE_URL, {
+          waitUntil: 'domcontentloaded',
+          timeout: TIMEOUTS_MS.pageNavigation,
+        });
         if (await this.isAuthorized(page)) {
           this.setState('authorized', 'Session restored');
           return page;
@@ -69,7 +93,7 @@ export class AvitoAuthService {
         // clients. The final state is set by the caller via the throw below.
         lastError = (err as Error).message;
         this.logger.warn(`Login attempt ${attempt} failed: ${lastError}`);
-        await this.sleep(2000 * attempt);
+        await this.sleep(TIMEOUTS_MS.retryBackoffBase * attempt);
       }
     }
 
@@ -98,16 +122,27 @@ export class AvitoAuthService {
       throw new Error('AVITO_LOGIN/AVITO_PASSWORD are not set');
     }
 
-    await page.goto(AVITO_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(AVITO_LOGIN_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: TIMEOUTS_MS.pageNavigation,
+    });
 
-    await this.waitForSelectorAny(page, SELECTORS.loginForm, 20000);
-    const loginInput = await this.waitForSelectorAny(page, SELECTORS.loginInput, 5000);
+    await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
+    const loginInput = await this.waitForSelectorAny(
+      page,
+      SELECTORS.loginInput,
+      TIMEOUTS_MS.inputAppear,
+    );
     await loginInput.click({ clickCount: 3 });
-    await loginInput.type(this.config.avitoLogin, { delay: 40 });
+    await loginInput.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
 
-    const passwordInput = await this.waitForSelectorAny(page, SELECTORS.passwordInput, 5000);
+    const passwordInput = await this.waitForSelectorAny(
+      page,
+      SELECTORS.passwordInput,
+      TIMEOUTS_MS.inputAppear,
+    );
     await passwordInput.click({ clickCount: 3 });
-    await passwordInput.type(this.config.avitoPassword, { delay: 40 });
+    await passwordInput.type(this.config.avitoPassword, { delay: TIMEOUTS_MS.typingKeystroke });
 
     // Race two events for the next 60s — register BOTH before clicking submit,
     // otherwise an immediate redirect can fire before we attach the listener.
@@ -115,11 +150,11 @@ export class AvitoAuthService {
     //   - waitForSelector(codeInput) resolves when the 2FA modal renders;
     //   - if neither fires in 60s, both reject → outcome is null → fail.
     const navPromise = page
-      .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 })
+      .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: TIMEOUTS_MS.loginOutcome })
       .then(() => 'redirected' as const)
       .catch(() => null);
     const codePromise = page
-      .waitForSelector(SELECTORS.codeInput, { timeout: 60000 })
+      .waitForSelector(SELECTORS.codeInput, { timeout: TIMEOUTS_MS.loginOutcome })
       .then(() => '2fa' as const)
       .catch(() => null);
 
@@ -135,14 +170,21 @@ export class AvitoAuthService {
       this.setState('awaiting_code', 'Avito requested 2FA code');
 
       const code = await this.requestCodeFromUser('SMS or app code requested by Avito');
-      const codeInput = await this.waitForSelectorAny(page, SELECTORS.codeInput, 5000);
+      const codeInput = await this.waitForSelectorAny(
+        page,
+        SELECTORS.codeInput,
+        TIMEOUTS_MS.inputAppear,
+      );
       await codeInput.click({ clickCount: 3 });
-      await codeInput.type(code, { delay: 40 });
+      await codeInput.type(code, { delay: TIMEOUTS_MS.typingKeystroke });
 
       // Only success criterion after 2FA submit is a real navigation. Same
       // registration-before-click rule as above.
       const navAfterCode = page
-        .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 })
+        .waitForNavigation({
+          waitUntil: 'domcontentloaded',
+          timeout: TIMEOUTS_MS.twoFactorRedirect,
+        })
         .then(() => true)
         .catch(() => false);
 
@@ -158,7 +200,10 @@ export class AvitoAuthService {
 
     // Land on the messenger so the watcher has the right page to observe.
     await page
-      .goto(AVITO_PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      .goto(AVITO_PROFILE_URL, {
+        waitUntil: 'domcontentloaded',
+        timeout: TIMEOUTS_MS.pageNavigation,
+      })
       .catch(() => undefined);
   }
 
@@ -185,13 +230,12 @@ export class AvitoAuthService {
 
   private requestCodeFromUser(reason: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(
-        () => {
-          this.pendingCodeResolver = null;
-          reject(new Error('2FA code timeout (5 min)'));
-        },
-        5 * 60 * 1000,
-      );
+      const timeout = setTimeout(() => {
+        this.pendingCodeResolver = null;
+        reject(
+          new Error(`2FA code timeout (${TIMEOUTS_MS.twoFactorCodeWait / 60000} min)`),
+        );
+      }, TIMEOUTS_MS.twoFactorCodeWait);
 
       this.pendingCodeResolver = (code: string) => {
         clearTimeout(timeout);
