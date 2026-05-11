@@ -58,6 +58,9 @@ export class AvitoAuthService {
 
   /** Resolves with a Page that is authorized in Avito. Throws on permanent failure. */
   async ensureAuthorized(): Promise<Page> {
+    this.logger.log(
+      `Auth flow started (max attempts: ${this.config.authMaxAttempts}, target: ${AVITO_PROFILE_URL})`,
+    );
     this.setState('starting');
     let page = await this.browser.newPage();
 
@@ -66,11 +69,16 @@ export class AvitoAuthService {
     while (attempt < this.config.authMaxAttempts) {
       attempt += 1;
       try {
+        this.logger.log(`Attempt ${attempt}/${this.config.authMaxAttempts}: probing session…`);
         await page.goto(AVITO_PROFILE_URL, {
           waitUntil: 'domcontentloaded',
           timeout: TIMEOUTS_MS.pageNavigation,
         });
-        if (await this.isAuthorized(page)) {
+        const authorized = await this.isAuthorized(page);
+        this.logger.log(
+          `Session probe: ${authorized ? 'channels/list found → authorized' : 'channels/list missing → need login'}`,
+        );
+        if (authorized) {
           this.setState('authorized', 'Session restored');
           return page;
         }
@@ -78,13 +86,19 @@ export class AvitoAuthService {
         // Discard the probe page — it may have an in-flight Avito redirect
         // and stale SPA state. Login flow gets a brand-new tab; cookies and
         // session live on the browser context (userDataDir), not the page.
+        this.logger.log('Discarding probe tab, opening fresh tab for login');
         await page.close().catch(() => undefined);
         page = await this.browser.newPage();
 
         this.setState('logging_in', `Attempt ${attempt}/${this.config.authMaxAttempts}`);
         await this.performLogin(page);
 
-        if (await this.isAuthorized(page)) {
+        this.logger.log('Re-probing session after login…');
+        const authorizedAfterLogin = await this.isAuthorized(page);
+        this.logger.log(
+          `Post-login probe: ${authorizedAfterLogin ? 'channels/list found → authorized' : 'channels/list missing → will retry'}`,
+        );
+        if (authorizedAfterLogin) {
           this.setState('authorized', 'Logged in');
           return page;
         }
@@ -93,7 +107,9 @@ export class AvitoAuthService {
         // clients. The final state is set by the caller via the throw below.
         lastError = (err as Error).message;
         this.logger.warn(`Login attempt ${attempt} failed: ${lastError}`);
-        await this.sleep(TIMEOUTS_MS.retryBackoffBase * attempt);
+        const backoff = TIMEOUTS_MS.retryBackoffBase * attempt;
+        this.logger.log(`Backing off ${backoff}ms before next attempt`);
+        await this.sleep(backoff);
       }
     }
 
@@ -126,12 +142,15 @@ export class AvitoAuthService {
     // hydrate — bundles fetched, login-modal JS executed, XHRs settled.
     // Otherwise the next waitForSelector(loginForm) ends up doing all the
     // waiting itself.
+    this.logger.log(`Navigating to login page (${AVITO_LOGIN_URL}, waitUntil=networkidle2)`);
     await page.goto(AVITO_LOGIN_URL, {
       waitUntil: 'networkidle2',
       timeout: TIMEOUTS_MS.pageNavigation,
     });
+    this.logger.log('Login page hydrated, waiting for login form…');
 
     await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
+    this.logger.log('Login form visible, filling login input');
     const loginInput = await this.waitForSelectorAny(
       page,
       SELECTORS.loginInput,
@@ -140,6 +159,7 @@ export class AvitoAuthService {
     await loginInput.click({ clickCount: 3 });
     await loginInput.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
 
+    this.logger.log('Filling password input');
     const passwordInput = await this.waitForSelectorAny(
       page,
       SELECTORS.passwordInput,
@@ -162,18 +182,25 @@ export class AvitoAuthService {
       .then(() => '2fa' as const)
       .catch(() => null);
 
+    this.logger.log('Submitting credentials, racing navigation vs 2FA prompt…');
     await this.tryClickSubmit(page);
 
     const outcome = await Promise.race([navPromise, codePromise]);
     if (outcome === null) {
       throw new Error('Login did not complete within 60s: neither redirect nor 2FA prompt');
     }
+    this.logger.log(
+      outcome === 'redirected'
+        ? 'Login outcome: navigation → credentials accepted, no 2FA'
+        : 'Login outcome: 2FA prompt rendered',
+    );
 
     if (outcome === '2fa') {
-      this.logger.log('2FA prompt detected — awaiting code from frontend');
+      this.logger.log('Emitting auth.needs_code, awaiting POST /auth/code from frontend');
       this.setState('awaiting_code', 'Avito requested 2FA code');
 
       const code = await this.requestCodeFromUser('SMS or app code requested by Avito');
+      this.logger.log('2FA code received from frontend, filling input');
       const codeInput = await this.waitForSelectorAny(
         page,
         SELECTORS.codeInput,
@@ -192,17 +219,20 @@ export class AvitoAuthService {
         .then(() => true)
         .catch(() => false);
 
+      this.logger.log('Submitting 2FA code, waiting for navigation…');
       await this.tryClickSubmit(page);
 
       if (!(await navAfterCode)) {
         throw new Error('2FA did not complete within 60s: no redirect after code submit');
       }
+      this.logger.log('2FA navigation landed — Avito accepted the code');
       // Real confirmation that Avito accepted the code, not just the user
       // submitting it to us. Emit only after the post-2FA navigation lands.
       this.events.emit('auth.code_accepted');
     }
 
     // Land on the messenger so the watcher has the right page to observe.
+    this.logger.log(`Landing on messenger (${AVITO_PROFILE_URL})`);
     await page
       .goto(AVITO_PROFILE_URL, {
         waitUntil: 'domcontentloaded',
