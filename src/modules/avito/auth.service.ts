@@ -122,8 +122,12 @@ export class AvitoAuthService {
       throw new Error('AVITO_LOGIN/AVITO_PASSWORD are not set');
     }
 
+    // networkidle2 (vs. domcontentloaded) waits for the SPA to actually
+    // hydrate — bundles fetched, login-modal JS executed, XHRs settled.
+    // Otherwise the next waitForSelector(loginForm) ends up doing all the
+    // waiting itself.
     await page.goto(AVITO_LOGIN_URL, {
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'networkidle2',
       timeout: TIMEOUTS_MS.pageNavigation,
     });
 
