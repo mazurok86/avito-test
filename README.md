@@ -177,8 +177,46 @@ npm run start:dev
 
 > **Совет на первый запуск:** оставьте `PUPPETEER_HEADLESS=false` и при
 > необходимости вручную пройдите CAPTCHA в открывшемся окне Chromium. После
-> этого сессия сохранится в `.chrome-profile`, и следующие запуски можно
-> делать в `headless=true`.
+> этого сессия сохранится в `.chrome-profile`.
+
+### 4. Запуск без графической оболочки (Xvfb)
+
+`PUPPETEER_HEADLESS=true` Авито детектит даже со stealth-плагином и сразу
+блокирует устройство по фингерпринту (внутри 2FA-модалки появляется «Доступ
+закрыт», затем IP уходит в бан). На сервере без X-сервера запускайте Chromium
+в `headless=false` под виртуальным дисплеем Xvfb.
+
+**Установка (Ubuntu/Debian):**
+
+```bash
+sudo apt-get install -y xvfb
+```
+
+**Запуск:**
+
+```bash
+# .env: PUPPETEER_HEADLESS=false
+xvfb-run -a --server-args="-screen 0 1366x850x24" npm run start:dev
+```
+
+Для production-бинаря:
+
+```bash
+xvfb-run -a --server-args="-screen 0 1366x850x24" node dist/main.js
+```
+
+Флаги:
+
+- `-a` — автоматический выбор свободного `:N` дисплея;
+- `-screen 0 1366x850x24` — размер совпадает с `defaultViewport` в
+  `BrowserService` (1366×850), глубина 24 бита.
+
+Если Авито уже успел забанить устройство, перед запуском удалите профиль —
+там лежит device-cookie антифрода:
+
+```bash
+rm -rf ./.chrome-profile
+```
 
 ## Docker
 

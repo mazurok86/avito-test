@@ -50,12 +50,7 @@ export class BrowserService implements OnModuleDestroy {
 
   async newPage(): Promise<Page> {
     const browser = await this.getBrowser();
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    );
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8' });
-    return page;
+    return browser.newPage();
   }
 
   async onModuleDestroy(): Promise<void> {
