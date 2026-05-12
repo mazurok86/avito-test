@@ -16,7 +16,7 @@ type ScanResult =
 // Periodic health monitor cadence. Catches DOM-contract drift and WS stalls
 // that the reactive paths (MutationObserver, CDP listener) would miss — for
 // example, after a full-page navigation that detaches the observer.
-const MONITOR_INTERVAL_MS = 60000;
+const MONITOR_INTERVAL_MS = 30000;
 
 // How long an inbound message addressed to an unknown channel stays buffered
 // until refreshTargetChats picks the channel up. Must exceed the worst-case
