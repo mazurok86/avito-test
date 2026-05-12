@@ -13,17 +13,30 @@ type ScanResult =
   | { ok: true; matches: Array<{ id: string; name: string }> }
   | { ok: false; reason: string };
 
-const PENDING_MSG_TTL_MS = 30000;
-
 // Periodic health monitor cadence. Catches DOM-contract drift and WS stalls
 // that the reactive paths (MutationObserver, CDP listener) would miss — for
 // example, after a full-page navigation that detaches the observer.
 const MONITOR_INTERVAL_MS = 60000;
 
+// How long an inbound message addressed to an unknown channel stays buffered
+// until refreshTargetChats picks the channel up. Must exceed the worst-case
+// gap between channel-list scans (= MONITOR_INTERVAL_MS, when the reactive
+// MutationObserver is detached). 2× provides margin for the actual refresh
+// to finish and for any timer jitter.
+const PENDING_MSG_TTL_MS = MONITOR_INTERVAL_MS * 2;
+
 // Max time without any inbound WS frame (including Avito's keepalive pings)
 // before we declare the socket dead. Avito's messenger pings well below this
 // threshold during normal operation.
 const WS_STALL_THRESHOLD_MS = 90000;
+
+// Debounce window for the channels-list MutationObserver — collapses bursts
+// of DOM mutations (typing indicators, read receipts, etc.) into one refresh.
+const CHANNEL_LIST_DEBOUNCE_MS = 2000;
+// Hard ceiling on debounce stretching. Under sustained churn the basic
+// debounce never settles; this guarantees the refresh fires at least every
+// CHANNEL_LIST_DEBOUNCE_MAX_MS regardless of how frequent the mutations are.
+const CHANNEL_LIST_DEBOUNCE_MAX_MS = 10000;
 
 // Single source of truth for Avito DOM selectors used by the watcher.
 // If Avito changes their markup, update these — and only these — to fix it.
@@ -267,6 +280,11 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     if (this.stopped || page.isClosed()) return;
     const target = this.config.targetUserName.toLowerCase();
     if (!target) return;
+
+    this.logger.log(
+      `refreshTargetChats triggered (tracked=${this.targetChats.size}, target="${this.config.targetUserName}")`,
+    );
+
     // Bump BEFORE the async work — the periodic monitor uses this timestamp
     // to decide whether to schedule its own scan.
     this.lastRefreshAt = Date.now();
@@ -365,20 +383,43 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
       void this.refreshTargetChats(page).catch(() => undefined);
     });
 
-    await page.evaluate((selector: string) => {
-      const root = document.querySelector<HTMLElement>(selector);
-      if (!root) return;
+    await page.evaluate(
+      (selector: string, debounceMs: number, maxWaitMs: number) => {
+        const root = document.querySelector<HTMLElement>(selector);
+        if (!root) return;
 
-      let debounce: ReturnType<typeof setTimeout> | null = null;
-      const trigger = () => {
-        if (debounce) clearTimeout(debounce);
-        debounce = setTimeout(() => {
+        let debounce: ReturnType<typeof setTimeout> | null = null;
+        let firstPendingAt = 0;
+
+        const fire = () => {
+          if (debounce) {
+            clearTimeout(debounce);
+            debounce = null;
+          }
+          firstPendingAt = 0;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (window as any).__avitoChannelListChanged?.();
-        }, 200);
-      };
+        };
 
-      new MutationObserver(trigger).observe(root, { childList: true, subtree: true });
-    }, CHANNELS_LIST_SELECTOR);
+        const trigger = () => {
+          const now = Date.now();
+          // Force-fire applies to the *previously accumulated* mutations,
+          // not the current one — if we've been stretching the debounce
+          // window past the ceiling, flush now and let the current mutation
+          // open a fresh window below.
+          if (firstPendingAt !== 0 && now - firstPendingAt >= maxWaitMs) {
+            fire();
+          }
+          if (firstPendingAt === 0) firstPendingAt = now;
+          if (debounce) clearTimeout(debounce);
+          debounce = setTimeout(fire, debounceMs);
+        };
+
+        new MutationObserver(trigger).observe(root, { childList: true, subtree: true });
+      },
+      CHANNELS_LIST_SELECTOR,
+      CHANNEL_LIST_DEBOUNCE_MS,
+      CHANNEL_LIST_DEBOUNCE_MAX_MS,
+    );
   }
 }
