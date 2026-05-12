@@ -16,6 +16,9 @@ export class AppConfigService {
 
   readonly authMaxAttempts: number = Number(process.env.AUTH_MAX_ATTEMPTS ?? 3);
 
+  readonly debugScreenshots: boolean =
+    (process.env.DEBUG_SCREENSHOTS ?? 'false').toLowerCase() === 'true';
+
   validate(): void {
     const missing: string[] = [];
     if (!this.avitoLogin) missing.push('AVITO_LOGIN');

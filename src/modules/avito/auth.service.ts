@@ -375,8 +375,10 @@ export class AvitoAuthService {
    * Dumps a full-page screenshot + HTML snapshot + current URL/title for
    * post-mortem debugging. Files go into ./debug-screenshots/<ts>-<label>.{png,html}.
    * Safe to call on any page state — all errors are swallowed.
+   * Gated by DEBUG_SCREENSHOTS env (off by default).
    */
   private async captureDebug(page: Page, label: string): Promise<void> {
+    if (!this.config.debugScreenshots) return;
     try {
       await mkdir(resolve(DEBUG_DIR), { recursive: true });
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
