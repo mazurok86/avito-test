@@ -1,14 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Frame, Page, WaitForOptions } from 'puppeteer';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
 
 import { AppConfigService } from '../../config/config.service';
 import { BrowserService } from './browser.service';
+import { PageDebugService } from './page-debug.service';
 import type { AuthState, StatusChange } from './avito.types';
-
-const DEBUG_DIR = './debug-screenshots';
 
 // Avito serves a "доступ ограничен" interstitial when rate-limiting or
 // IP-blocking — retrying the same flow won't unblock us, so we surface this
@@ -75,6 +72,7 @@ export class AvitoAuthService {
     private readonly config: AppConfigService,
     private readonly browser: BrowserService,
     private readonly events: EventEmitter2,
+    private readonly pageDebug: PageDebugService,
   ) {}
 
   /** Resolves with a Page that is authorized in Avito. Throws on permanent failure. */
@@ -101,7 +99,7 @@ export class AvitoAuthService {
         this.logger.log(
           `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
         );
-        await this.captureDebug(page, `session-probe-${authorized ? 'authorized' : 'anon'}`);
+        await this.pageDebug.captureDebug(page, `session-probe-${authorized ? 'authorized' : 'anon'}`);
         if (authorized) {
           this.setState('authorized', 'Session restored');
           return page;
@@ -122,7 +120,7 @@ export class AvitoAuthService {
         this.logger.log(
           `Post-login probe: ${authorizedAfterLogin ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → will retry'}`,
         );
-        await this.captureDebug(
+        await this.pageDebug.captureDebug(
           page,
           `post-login-probe-${authorizedAfterLogin ? 'authorized' : 'anon'}`,
         );
@@ -185,19 +183,19 @@ export class AvitoAuthService {
       'login-page',
     );
     this.logger.log('Login page hydrated, waiting for login form…');
-    await this.captureDebug(page, 'after-login-page-load');
+    await this.pageDebug.captureDebug(page, 'after-login-page-load');
 
     try {
       await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
     } catch (err) {
-      await this.captureDebug(page, 'login-form-timeout');
+      await this.pageDebug.captureDebug(page, 'login-form-timeout');
       throw err;
     }
     this.logger.log(
       `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms before filling inputs`,
     );
     await this.sleep(TIMEOUTS_MS.loginFormSettle);
-    await this.captureDebug(page, 'after-settle');
+    await this.pageDebug.captureDebug(page, 'after-settle');
     this.logger.log('Filling login input');
     const loginInput = await this.waitForSelectorAny(
       page,
@@ -206,7 +204,7 @@ export class AvitoAuthService {
     );
     await loginInput.click({ clickCount: 3 });
     await loginInput.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
-    await this.captureDebug(page, 'login-filled');
+    await this.pageDebug.captureDebug(page, 'login-filled');
 
     this.logger.log('Filling password input');
     const passwordInput = await this.waitForSelectorAny(
@@ -216,7 +214,7 @@ export class AvitoAuthService {
     );
     await passwordInput.click({ clickCount: 3 });
     await passwordInput.type(this.config.avitoPassword, { delay: TIMEOUTS_MS.typingKeystroke });
-    await this.captureDebug(page, 'password-filled');
+    await this.pageDebug.captureDebug(page, 'password-filled');
 
     // Race two events for the next 60s — register BOTH before clicking submit,
     // otherwise an immediate redirect can fire before we attach the listener.
@@ -234,11 +232,11 @@ export class AvitoAuthService {
 
     this.logger.log('Submitting credentials, racing navigation vs 2FA prompt…');
     await this.tryClickSubmit(page);
-    await this.captureDebug(page, 'after-credentials-submit');
+    await this.pageDebug.captureDebug(page, 'after-credentials-submit');
 
     const outcome = await Promise.race([navPromise, codePromise]);
     if (outcome === null) {
-      await this.captureDebug(page, 'login-outcome-timeout');
+      await this.pageDebug.captureDebug(page, 'login-outcome-timeout');
       throw new Error('Login did not complete within 60s: neither redirect nor 2FA prompt');
     }
     this.logger.log(
@@ -246,7 +244,7 @@ export class AvitoAuthService {
         ? 'Login outcome: navigation → credentials accepted, no 2FA'
         : 'Login outcome: 2FA prompt rendered',
     );
-    await this.captureDebug(page, `login-outcome-${outcome === 'redirected' ? 'redirected' : '2fa'}`);
+    await this.pageDebug.captureDebug(page, `login-outcome-${outcome === 'redirected' ? 'redirected' : '2fa'}`);
 
     if (outcome === '2fa') {
       this.logger.log('Emitting auth.needs_code, awaiting POST /auth/code from frontend');
@@ -261,7 +259,7 @@ export class AvitoAuthService {
       );
       await codeInput.click({ clickCount: 3 });
       await codeInput.type(code, { delay: TIMEOUTS_MS.typingKeystroke });
-      await this.captureDebug(page, 'code-filled');
+      await this.pageDebug.captureDebug(page, 'code-filled');
 
       // Only success criterion after 2FA submit is a real navigation. Same
       // registration-before-click rule as above.
@@ -275,14 +273,14 @@ export class AvitoAuthService {
 
       this.logger.log('Submitting 2FA code, waiting for navigation…');
       await this.tryClickSubmit(page);
-      await this.captureDebug(page, 'after-code-submit');
+      await this.pageDebug.captureDebug(page, 'after-code-submit');
 
       if (!(await navAfterCode)) {
-        await this.captureDebug(page, 'post-2fa-timeout');
+        await this.pageDebug.captureDebug(page, 'post-2fa-timeout');
         throw new Error('2FA did not complete within 60s: no redirect after code submit');
       }
       this.logger.log('2FA navigation landed — Avito accepted the code');
-      await this.captureDebug(page, 'post-2fa-success');
+      await this.pageDebug.captureDebug(page, 'post-2fa-success');
       // Real confirmation that Avito accepted the code, not just the user
       // submitting it to us. Emit only after the post-2FA navigation lands.
       this.events.emit('auth.code_accepted');
@@ -363,38 +361,11 @@ export class AvitoAuthService {
       this.logger.log(`[nav:${label}] page title = "${title}"`);
 
       if (title.includes(BLOCKED_TITLE_MARKER)) {
-        await this.captureDebug(page, `${label}-blocked`);
+        await this.pageDebug.captureDebug(page, `${label}-blocked`);
         throw new AvitoAccessBlockedError(`title="${title}", url=${finalUrl}`);
       }
     } finally {
       page.off('framenavigated', onNav);
-    }
-  }
-
-  /**
-   * Dumps a full-page screenshot + HTML snapshot + current URL/title for
-   * post-mortem debugging. Files go into ./debug-screenshots/<ts>-<label>.{png,html}.
-   * Safe to call on any page state — all errors are swallowed.
-   * Gated by DEBUG_SCREENSHOTS env (off by default).
-   */
-  private async captureDebug(page: Page, label: string): Promise<void> {
-    if (!this.config.debugScreenshots) return;
-    try {
-      await mkdir(resolve(DEBUG_DIR), { recursive: true });
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const safeLabel = label.replace(/[^a-z0-9-]+/gi, '_');
-      const base = resolve(DEBUG_DIR, `${stamp}-${safeLabel}`);
-
-      const url = page.url();
-      const title = await page.title().catch(() => '<title unavailable>');
-      this.logger.log(`[DEBUG] capture "${label}": url=${url} title=${title}`);
-
-      await page.screenshot({ path: `${base}.png` as `${string}.png`, fullPage: true });
-      const html = await page.content();
-      await writeFile(`${base}.html`, html, 'utf8');
-      this.logger.log(`[DEBUG] capture "${label}" → ${base}.{png,html}`);
-    } catch (err) {
-      this.logger.warn(`[DEBUG] capture "${label}" failed: ${(err as Error).message}`);
     }
   }
 

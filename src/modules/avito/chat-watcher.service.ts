@@ -6,6 +6,7 @@ import { AppConfigService } from '../../config/config.service';
 import { AvitoAuthService } from './auth.service';
 import type { AvitoMessage, StatusChange } from './avito.types';
 import { parseMessageFrame } from './message-frame.parser';
+import { PageDebugService } from './page-debug.service';
 
 const MESSENGER_URL = 'https://www.avito.ru/profile/messenger';
 
@@ -55,6 +56,7 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
   private readonly pendingByChannel = new Map<string, { msgs: AvitoMessage[]; expiresAt: number }>();
   private startedAt = 0;
   private stopped = false;
+  private restarting = false;
   private lastFrameAt = 0;
   private lastRefreshAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,6 +65,7 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     private readonly config: AppConfigService,
     private readonly auth: AvitoAuthService,
     private readonly events: EventEmitter2,
+    private readonly pageDebug: PageDebugService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -121,8 +124,54 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Recoverable counterpart to halt(): snapshot the current page for
+   * diagnosis, tear down the page/CDP/timer, and re-run start() to reopen
+   * the messenger from scratch (re-using the existing browser session).
+   * Falls back to halt() if start() throws.
+   */
+  private async restart(reason: string): Promise<void> {
+    if (this.stopped || this.restarting) return;
+    this.restarting = true;
+
+    try {
+      this.logger.warn(`Restarting watcher: ${reason}`);
+      this.events.emit('status.change', {
+        state: 'starting',
+        detail: `Restarting: ${reason}`,
+        at: new Date().toISOString(),
+      } satisfies StatusChange);
+
+      // Screenshot BEFORE teardown — captures the failure state for diagnosis.
+      if (this.page) await this.pageDebug.capture(this.page, 'restart');
+
+      if (this.monitorTimer) {
+        clearInterval(this.monitorTimer);
+        this.monitorTimer = null;
+      }
+      this.pendingByChannel.clear();
+      this.targetChats.clear();
+      if (this.cdp) {
+        await this.cdp.detach().catch(() => undefined);
+        this.cdp = null;
+      }
+      if (this.page && !this.page.isClosed()) {
+        await this.page.close().catch(() => undefined);
+      }
+      this.page = null;
+
+      await this.start();
+    } catch (err) {
+      this.halt(`restart failed: ${(err as Error).message}`);
+    } finally {
+      this.restarting = false;
+    }
+  }
+
   private async start(): Promise<void> {
-    this.startedAt = Date.now();
+    // Preserve startedAt across restarts so emitMessage() keeps filtering
+    // messages that predate the original app launch.
+    if (this.startedAt === 0) this.startedAt = Date.now();
     this.page = await this.auth.ensureAuthorized();
 
     await this.attachWsInterceptor(this.page);
@@ -185,7 +234,9 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     }
     const sinceLastFrame = Date.now() - this.lastFrameAt;
     if (sinceLastFrame > WS_STALL_THRESHOLD_MS) {
-      this.halt(`WS stalled: no frames received in ${Math.round(sinceLastFrame / 1000)}s`);
+      await this.restart(
+        `WS stalled: no frames received in ${Math.round(sinceLastFrame / 1000)}s`,
+      );
       return;
     }
     // Skip DOM probe if a refresh ran recently — observer-triggered scans
