@@ -31,6 +31,12 @@ const PENDING_MSG_TTL_MS = MONITOR_INTERVAL_MS * 2;
 // threshold during normal operation.
 const WS_STALL_THRESHOLD_MS = 90000;
 
+// Recovery cycle for transient channels-list root absence after navigation:
+// wait, recheck the selector, and (if still missing) restart. We allow up to
+// MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS cycles before halting.
+const CHANNELS_LIST_RECHECK_DELAY_MS = 60000;
+const MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS = 3;
+
 // Debounce window for the channels-list MutationObserver — collapses bursts
 // of DOM mutations (typing indicators, read receipts, etc.) into one refresh.
 const CHANNEL_LIST_DEBOUNCE_MS = 2000;
@@ -60,6 +66,7 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
   private lastFrameAt = 0;
   private lastRefreshAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
+  private channelsListRecoveryAttempts = 0;
 
   constructor(
     private readonly config: AppConfigService,
@@ -178,11 +185,36 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     await this.page.goto(MESSENGER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     // Root must be present immediately after DOMContentLoaded (server-rendered).
-    const rootHandle = await this.page.$(CHANNELS_LIST_SELECTOR);
+    let rootHandle = await this.page.$(CHANNELS_LIST_SELECTOR);
     if (!rootHandle) {
-      this.halt(`channels-list root selector not found: ${CHANNELS_LIST_SELECTOR}`);
-      return;
+      if (this.channelsListRecoveryAttempts >= MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS) {
+        this.halt(
+          `channels-list root selector not found after ${MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS} recovery attempts: ${CHANNELS_LIST_SELECTOR}`,
+        );
+        return;
+      }
+      this.channelsListRecoveryAttempts += 1;
+      this.logger.warn(
+        `channels-list root selector not found (attempt ${this.channelsListRecoveryAttempts}/${MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS}); waiting ${CHANNELS_LIST_RECHECK_DELAY_MS / 1000}s before recheck`,
+      );
+      await this.pageDebug.capture(this.page, 'channels-list-missing');
+      await new Promise<void>((resolve) => setTimeout(resolve, CHANNELS_LIST_RECHECK_DELAY_MS));
+      if (this.stopped || !this.page || this.page.isClosed()) return;
+      rootHandle = await this.page.$(CHANNELS_LIST_SELECTOR);
+      if (!rootHandle) {
+        // Defer restart() to after this start() (and any enclosing restart())
+        // completes — restart()'s reentrancy guard would otherwise reject us.
+        const attempt = this.channelsListRecoveryAttempts;
+        setTimeout(() => {
+          void this.restart(
+            `channels-list root selector still missing after recheck (attempt ${attempt}/${MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS})`,
+          );
+        }, 0);
+        return;
+      }
+      this.logger.log('channels-list root selector appeared after recheck — continuing');
     }
+    this.channelsListRecoveryAttempts = 0;
     await rootHandle.dispose();
 
     // Initial scan + contract validation + populate targetChatIds.
@@ -388,6 +420,7 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
       .catch((err): ScanResult => ({ ok: false, reason: `evaluate failed: ${(err as Error).message}` }));
 
     if (!result.ok) {
+      await this.pageDebug.capture(page, 'refresh-failed');
       this.halt(result.reason);
       return;
     }
