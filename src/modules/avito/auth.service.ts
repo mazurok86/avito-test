@@ -55,6 +55,11 @@ const SELECTORS = {
   submitButton: 'form[data-marker="login-form"] button[data-marker="login-form/submit"]',
   codeInput:
     '[data-marker="code-form/code/input"], [data-marker="code/input"], input[name="code"], input[name="codeConfirm"], input[autocomplete="one-time-code"]',
+  // Avito sometimes shows a "saved users" picker instead of the regular login
+  // form when the browser has remembered an account. Picking a user takes us
+  // to the avatar variant of the login form (password-only; login pre-filled).
+  usersList: '[data-marker="users-list"]',
+  usersListFirstUser: '[data-marker="users-list"] [data-marker="user/link"]',
   // Profile menu in the site header. Present on any Avito page only when a
   // user session is active — independent of which path we landed on, so
   // it's a clean session indicator.
@@ -182,29 +187,50 @@ export class AvitoAuthService {
       { waitUntil: 'load', timeout: TIMEOUTS_MS.pageNavigation },
       'login-page',
     );
-    this.logger.log('Login page hydrated, waiting for login form…');
+    this.logger.log('Login page hydrated, waiting for login form or saved users picker…');
     await this.pageDebug.captureDebug(page, 'after-login-page-load');
 
-    try {
-      await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
-    } catch (err) {
-      await this.pageDebug.captureDebug(page, 'login-form-timeout');
-      throw err;
+    const variant = await this.waitForLoginVariant(page);
+    this.logger.log(`Login variant: ${variant}`);
+
+    if (variant === 'users-list') {
+      await this.pageDebug.captureDebug(page, 'users-list-detected');
+      this.logger.log('Saved users picker shown — clicking saved account');
+      const userLink = await this.waitForSelectorAny(
+        page,
+        SELECTORS.usersListFirstUser,
+        TIMEOUTS_MS.inputAppear,
+      );
+      await userLink.click();
+      await this.pageDebug.captureDebug(page, 'after-user-click');
+
+      this.logger.log('Waiting for avatar login form to mount…');
+      try {
+        await this.waitForSelectorAny(page, SELECTORS.loginForm, TIMEOUTS_MS.loginFormAppear);
+      } catch (err) {
+        await this.pageDebug.captureDebug(page, 'avatar-form-timeout');
+        throw err;
+      }
     }
+
     this.logger.log(
       `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms before filling inputs`,
     );
     await this.sleep(TIMEOUTS_MS.loginFormSettle);
     await this.pageDebug.captureDebug(page, 'after-settle');
-    this.logger.log('Filling login input');
-    const loginInput = await this.waitForSelectorAny(
-      page,
-      SELECTORS.loginInput,
-      TIMEOUTS_MS.inputAppear,
-    );
-    await loginInput.click({ clickCount: 3 });
-    await loginInput.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
-    await this.pageDebug.captureDebug(page, 'login-filled');
+
+    // Avatar variant pre-fills the login as a hidden input — no visible login
+    // field. Detect by querying SELECTORS.loginInput; absence == avatar variant.
+    const loginInputHandle = await page.$(SELECTORS.loginInput);
+    if (loginInputHandle) {
+      this.logger.log('Filling login input');
+      await loginInputHandle.click({ clickCount: 3 });
+      await loginInputHandle.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
+      await loginInputHandle.dispose();
+      await this.pageDebug.captureDebug(page, 'login-filled');
+    } else {
+      this.logger.log('Avatar login form (login pre-filled) — skipping login input');
+    }
 
     this.logger.log('Filling password input');
     const passwordInput = await this.waitForSelectorAny(
@@ -310,6 +336,29 @@ export class AvitoAuthService {
     const handle = await page.waitForSelector(selector, { timeout });
     if (!handle) throw new Error(`Selector not found: ${selector}`);
     return handle;
+  }
+
+  /**
+   * After landing on the login page Avito renders one of:
+   *   - the regular login form (`form[data-marker="login-form"]`);
+   *   - a saved-users picker (`[data-marker="users-list"]`) when the browser
+   *     has remembered an account on this profile.
+   * Race both and return whichever appears first.
+   */
+  private async waitForLoginVariant(page: Page): Promise<'login-form' | 'users-list'> {
+    try {
+      return await Promise.any([
+        page
+          .waitForSelector(SELECTORS.loginForm, { timeout: TIMEOUTS_MS.loginFormAppear })
+          .then(() => 'login-form' as const),
+        page
+          .waitForSelector(SELECTORS.usersList, { timeout: TIMEOUTS_MS.loginFormAppear })
+          .then(() => 'users-list' as const),
+      ]);
+    } catch {
+      await this.pageDebug.captureDebug(page, 'login-form-timeout');
+      throw new Error('Neither login form nor saved users picker appeared');
+    }
   }
 
   /**
