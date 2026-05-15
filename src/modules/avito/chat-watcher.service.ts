@@ -188,6 +188,7 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
     let rootHandle = await this.page.$(CHANNELS_LIST_SELECTOR);
     if (!rootHandle) {
       if (this.channelsListRecoveryAttempts >= MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS) {
+        await this.pageDebug.capture(this.page, 'channels-list-missing-final');
         this.halt(
           `channels-list root selector not found after ${MAX_CHANNELS_LIST_RECOVERY_ATTEMPTS} recovery attempts: ${CHANNELS_LIST_SELECTOR}`,
         );
