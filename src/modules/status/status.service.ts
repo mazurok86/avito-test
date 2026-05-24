@@ -1,11 +1,16 @@
 import { Injectable } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 
-import type { AuthCodeRequest, StatusChange } from '../avito/avito.types';
+import type {
+  AuthCodeRequest,
+  AuthCredentialsRequest,
+  StatusChange,
+} from '../avito/avito.types';
 
 export interface StatusSnapshot {
   status: StatusChange;
   awaitingCode: AuthCodeRequest | null;
+  awaitingCredentials: AuthCredentialsRequest | null;
 }
 
 /**
@@ -22,14 +27,20 @@ export class StatusService {
   // the auth flow kicks off get a meaningful state instead of null.
   private status: StatusChange = { state: 'idle', at: new Date().toISOString() };
   private awaitingCode: AuthCodeRequest | null = null;
+  private awaitingCredentials: AuthCredentialsRequest | null = null;
 
   @OnEvent('status.change')
   onStatusChange(payload: StatusChange): void {
     this.status = payload;
-    // Any state transition out of awaiting_code invalidates a pending 2FA prompt
-    // (login succeeded, errored, or restarted). Keep the snapshot consistent.
+    // Any state transition out of awaiting_code/awaiting_credentials
+    // invalidates the corresponding pending prompt (login succeeded, errored,
+    // or restarted). Keep the snapshot consistent so reconnecting clients
+    // don't get a stale "please enter code/credentials" panel.
     if (payload.state !== 'awaiting_code') {
       this.awaitingCode = null;
+    }
+    if (payload.state !== 'awaiting_credentials') {
+      this.awaitingCredentials = null;
     }
   }
 
@@ -43,10 +54,16 @@ export class StatusService {
     this.awaitingCode = null;
   }
 
+  @OnEvent('auth.needs_credentials')
+  onAuthNeedsCredentials(payload: AuthCredentialsRequest): void {
+    this.awaitingCredentials = payload;
+  }
+
   getSnapshot(): StatusSnapshot {
     return {
       status: this.status,
       awaitingCode: this.awaitingCode,
+      awaitingCredentials: this.awaitingCredentials,
     };
   }
 }

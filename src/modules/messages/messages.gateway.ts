@@ -8,7 +8,12 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 
-import type { AuthCodeRequest, AvitoMessage, StatusChange } from '../avito/avito.types';
+import type {
+  AuthCodeRequest,
+  AuthCredentialsRequest,
+  AvitoMessage,
+  StatusChange,
+} from '../avito/avito.types';
 import { StatusService } from '../status/status.service';
 
 @WebSocketGateway({ cors: { origin: true, credentials: true } })
@@ -24,6 +29,9 @@ export class MessagesGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.logger.log(`Client connected: ${client.id}`);
     const snapshot = this.status.getSnapshot();
     client.emit('status:change', snapshot.status);
+    if (snapshot.awaitingCredentials) {
+      client.emit('auth:needs_credentials', snapshot.awaitingCredentials);
+    }
     if (snapshot.awaitingCode) client.emit('auth:needs_code', snapshot.awaitingCode);
   }
 
@@ -49,5 +57,10 @@ export class MessagesGateway implements OnGatewayConnection, OnGatewayDisconnect
   @OnEvent('auth.code_accepted')
   onAuthCodeAccepted(): void {
     this.server.emit('auth:code_accepted', { at: new Date().toISOString() });
+  }
+
+  @OnEvent('auth.needs_credentials')
+  onAuthNeedsCredentials(payload: AuthCredentialsRequest): void {
+    this.server.emit('auth:needs_credentials', payload);
   }
 }

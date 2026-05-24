@@ -7,6 +7,6 @@ import { PageDebugService } from './page-debug.service';
 
 @Module({
   providers: [BrowserService, AvitoAuthService, ChatWatcherService, PageDebugService],
-  exports: [AvitoAuthService],
+  exports: [AvitoAuthService, ChatWatcherService],
 })
 export class AvitoModule {}

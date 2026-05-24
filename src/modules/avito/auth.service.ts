@@ -2,14 +2,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Frame, Page, WaitForOptions } from 'puppeteer';
 
-import { AppConfigService } from '../../config/config.service';
 import { BrowserService } from './browser.service';
 import { PageDebugService } from './page-debug.service';
 import type { AuthState, StatusChange } from './avito.types';
 
 // Avito serves a "доступ ограничен" interstitial when rate-limiting or
-// IP-blocking — retrying the same flow won't unblock us, so we surface this
-// as a typed error and bail out of the retry loop.
+// IP-blocking. We surface this as a typed error so callers (and logs) can
+// distinguish "Avito turned us away" from generic timeout/DOM failures.
 const BLOCKED_TITLE_MARKER = 'Доступ ограничен';
 
 class AvitoAccessBlockedError extends Error {
@@ -43,8 +42,8 @@ const TIMEOUTS_MS = {
   twoFactorRedirect: 60000,
   /** How long the service waits for the user to deliver a 2FA code via POST /auth/code. */
   twoFactorCodeWait: 5 * 60000,
-  /** Base for linear backoff between retries (multiplied by attempt number). */
-  retryBackoffBase: 2000,
+  /** How long the service waits for the user to deliver login + password via POST /auth/credentials. */
+  credentialsWait: 5 * 60000,
 };
 
 // Login is rendered as a modal on top of the home page (#login hash).
@@ -67,97 +66,96 @@ const SELECTORS = {
 };
 
 type CodeResolver = (code: string) => void;
+type CredentialsResolver = (creds: { login: string; password: string }) => void;
+type TimeoutHandle = ReturnType<typeof setTimeout>;
 
 @Injectable()
 export class AvitoAuthService {
   private readonly logger = new Logger(AvitoAuthService.name);
   private pendingCodeResolver: CodeResolver | null = null;
+  private pendingCodeTimeout: TimeoutHandle | null = null;
+  private pendingCredentialsResolver: CredentialsResolver | null = null;
+  private pendingCredentialsTimeout: TimeoutHandle | null = null;
 
   constructor(
-    private readonly config: AppConfigService,
     private readonly browser: BrowserService,
     private readonly events: EventEmitter2,
     private readonly pageDebug: PageDebugService,
   ) {}
 
-  /** Resolves with a Page that is authorized in Avito. Throws on permanent failure. */
+  /**
+   * Resolves with a Page that is authorized in Avito. Single attempt — any
+   * failure (timeouts, blocked access, post-login probe fails) throws and
+   * leaves the watcher in `error` state. Restart the service to retry.
+   */
   async ensureAuthorized(): Promise<Page> {
-    this.logger.log(
-      `Auth flow started (max attempts: ${this.config.authMaxAttempts}, target: ${AVITO_PROFILE_URL})`,
-    );
+    this.logger.log(`Auth flow started (target: ${AVITO_PROFILE_URL})`);
     this.setState('starting');
     let page = await this.browser.newPage();
 
-    let attempt = 0;
-    let lastError: string | null = null;
-    while (attempt < this.config.authMaxAttempts) {
-      attempt += 1;
-      try {
-        this.logger.log(`Attempt ${attempt}/${this.config.authMaxAttempts}: probing session…`);
-        await this.gotoWithChain(
-          page,
-          AVITO_PROFILE_URL,
-          { waitUntil: 'domcontentloaded', timeout: TIMEOUTS_MS.pageNavigation },
-          'session-probe',
-        );
-        const authorized = await this.isAuthorized(page);
-        this.logger.log(
-          `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
-        );
-        await this.pageDebug.captureDebug(page, `session-probe-${authorized ? 'authorized' : 'anon'}`);
-        if (authorized) {
-          this.setState('authorized', 'Session restored');
-          return page;
-        }
-
-        // Discard the probe page — it may have an in-flight Avito redirect
-        // and stale SPA state. Login flow gets a brand-new tab; cookies and
-        // session live on the browser context (userDataDir), not the page.
-        this.logger.log('Discarding probe tab, opening fresh tab for login');
-        await page.close().catch(() => undefined);
-        page = await this.browser.newPage();
-
-        this.setState('logging_in', `Attempt ${attempt}/${this.config.authMaxAttempts}`);
-        await this.performLogin(page);
-
-        this.logger.log('Re-probing session after login…');
-        const authorizedAfterLogin = await this.isAuthorized(page);
-        this.logger.log(
-          `Post-login probe: ${authorizedAfterLogin ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → will retry'}`,
-        );
-        await this.pageDebug.captureDebug(
-          page,
-          `post-login-probe-${authorizedAfterLogin ? 'authorized' : 'anon'}`,
-        );
-        if (authorizedAfterLogin) {
-          this.setState('authorized', 'Logged in');
-          return page;
-        }
-      } catch (err) {
-        // Don't emit error here — it'd flicker between retries and mislead
-        // clients. The final state is set by the caller via the throw below.
-        lastError = (err as Error).message;
-        this.logger.warn(`Login attempt ${attempt} failed: ${lastError}`);
-
-        // Avito-side block (rate-limit / IP-ban) — retrying the same flow
-        // from the same IP won't unblock us. Bail out immediately so the
-        // operator sees the real cause instead of waiting through all retries.
-        if (err instanceof AvitoAccessBlockedError) {
-          this.logger.error('Aborting retry loop: Avito blocked access');
-          throw err;
-        }
-
-        const backoff = TIMEOUTS_MS.retryBackoffBase * attempt;
-        this.logger.log(`Backing off ${backoff}ms before next attempt`);
-        await this.sleep(backoff);
-      }
+    this.logger.log('Probing session…');
+    await this.gotoWithChain(
+      page,
+      AVITO_PROFILE_URL,
+      { waitUntil: 'domcontentloaded', timeout: TIMEOUTS_MS.pageNavigation },
+      'session-probe',
+    );
+    const authorized = await this.isAuthorized(page);
+    this.logger.log(
+      `Session probe: ${authorized ? 'header/menu-profile found → authorized' : 'header/menu-profile missing → need login'}`,
+    );
+    await this.pageDebug.captureDebug(page, `session-probe-${authorized ? 'authorized' : 'anon'}`);
+    if (authorized) {
+      this.setState('authorized', 'Session restored');
+      return page;
     }
 
-    throw new Error(
-      lastError
-        ? `Failed to authorize on Avito after ${this.config.authMaxAttempts} attempts: ${lastError}`
-        : `Failed to authorize on Avito after ${this.config.authMaxAttempts} attempts`,
+    // Discard the probe page — it may have an in-flight Avito redirect
+    // and stale SPA state. Login flow gets a brand-new tab; cookies and
+    // session live on the browser context (userDataDir), not the page.
+    this.logger.log('Discarding probe tab, opening fresh tab for login');
+    await page.close().catch(() => undefined);
+    page = await this.browser.newPage();
+
+    this.setState('logging_in', 'Performing login');
+    await this.performLogin(page);
+
+    this.logger.log('Re-probing session after login…');
+    const authorizedAfterLogin = await this.isAuthorized(page);
+    this.logger.log(
+      `Post-login probe: ${authorizedAfterLogin ? 'header/menu-profile found → authorized' : 'header/menu-profile missing'}`,
     );
+    await this.pageDebug.captureDebug(
+      page,
+      `post-login-probe-${authorizedAfterLogin ? 'authorized' : 'anon'}`,
+    );
+    if (!authorizedAfterLogin) {
+      throw new Error(
+        'Authorization failed: post-login session probe did not find header/menu-profile',
+      );
+    }
+    this.setState('authorized', 'Logged in');
+    return page;
+  }
+
+  /**
+   * Drop any in-flight code/credentials requests. Called when the watcher
+   * restarts after an error — without this, a stale setTimeout from the
+   * previous attempt can fire mid-restart and silently null out the new
+   * attempt's pending resolver (because both write to the same field), so
+   * the new attempt's request would hang until its own timeout.
+   */
+  resetPendingRequests(): void {
+    if (this.pendingCodeTimeout) {
+      clearTimeout(this.pendingCodeTimeout);
+      this.pendingCodeTimeout = null;
+    }
+    if (this.pendingCredentialsTimeout) {
+      clearTimeout(this.pendingCredentialsTimeout);
+      this.pendingCredentialsTimeout = null;
+    }
+    this.pendingCodeResolver = null;
+    this.pendingCredentialsResolver = null;
   }
 
   /** Called by REST endpoint when the user submits a 2FA code. */
@@ -165,6 +163,10 @@ export class AvitoAuthService {
     if (!this.pendingCodeResolver) return false;
     const resolver = this.pendingCodeResolver;
     this.pendingCodeResolver = null;
+    if (this.pendingCodeTimeout) {
+      clearTimeout(this.pendingCodeTimeout);
+      this.pendingCodeTimeout = null;
+    }
     resolver(code);
     return true;
   }
@@ -173,11 +175,24 @@ export class AvitoAuthService {
     return this.pendingCodeResolver !== null;
   }
 
-  private async performLogin(page: Page): Promise<void> {
-    if (!this.config.avitoLogin || !this.config.avitoPassword) {
-      throw new Error('AVITO_LOGIN/AVITO_PASSWORD are not set');
+  /** Called by REST endpoint when the user submits Avito login + password. */
+  submitCredentials(login: string, password: string): boolean {
+    if (!this.pendingCredentialsResolver) return false;
+    const resolver = this.pendingCredentialsResolver;
+    this.pendingCredentialsResolver = null;
+    if (this.pendingCredentialsTimeout) {
+      clearTimeout(this.pendingCredentialsTimeout);
+      this.pendingCredentialsTimeout = null;
     }
+    resolver({ login, password });
+    return true;
+  }
 
+  isAwaitingCredentials(): boolean {
+    return this.pendingCredentialsResolver !== null;
+  }
+
+  private async performLogin(page: Page): Promise<void> {
     // 'load' (vs. domcontentloaded) waits for all blocking subresources —
     // bundles, CSS, async scripts — so the login modal has its JS available
     // by the time we start hunting for the form selector.
@@ -213,19 +228,33 @@ export class AvitoAuthService {
       }
     }
 
+    // Form is on screen. Run two things concurrently:
+    //   * the mandatory settle delay (Avito's SPA re-renders the form right
+    //     after mount; typing before this finishes causes handle races);
+    //   * the credentials request to the user via WS + REST.
+    // Whichever finishes last gates the typing step. In practice the user
+    // takes much longer than the settle, so the settle is "free".
     this.logger.log(
-      `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms before filling inputs`,
+      `Login form visible — settling ${TIMEOUTS_MS.loginFormSettle}ms and asking user for credentials in parallel`,
     );
-    await this.sleep(TIMEOUTS_MS.loginFormSettle);
+    const settlePromise = this.sleep(TIMEOUTS_MS.loginFormSettle);
+    this.setState('awaiting_credentials', 'Введите Avito-логин и пароль на странице');
+    const credentialsPromise = this.requestCredentialsFromUser(
+      'Avito requires login + password',
+    );
+    const [{ login, password }] = await Promise.all([credentialsPromise, settlePromise]);
+    this.setState('logging_in', 'Credentials received, submitting');
     await this.pageDebug.captureDebug(page, 'after-settle');
 
     // Avatar variant pre-fills the login as a hidden input — no visible login
     // field. Detect by querying SELECTORS.loginInput; absence == avatar variant.
+    // (The login the user typed in the UI is silently discarded in that case;
+    // Avito has already locked the account-selector to one user.)
     const loginInputHandle = await page.$(SELECTORS.loginInput);
     if (loginInputHandle) {
       this.logger.log('Filling login input');
       await loginInputHandle.click({ clickCount: 3 });
-      await loginInputHandle.type(this.config.avitoLogin, { delay: TIMEOUTS_MS.typingKeystroke });
+      await loginInputHandle.type(login, { delay: TIMEOUTS_MS.typingKeystroke });
       await loginInputHandle.dispose();
       await this.pageDebug.captureDebug(page, 'login-filled');
     } else {
@@ -239,7 +268,7 @@ export class AvitoAuthService {
       TIMEOUTS_MS.inputAppear,
     );
     await passwordInput.click({ clickCount: 3 });
-    await passwordInput.type(this.config.avitoPassword, { delay: TIMEOUTS_MS.typingKeystroke });
+    await passwordInput.type(password, { delay: TIMEOUTS_MS.typingKeystroke });
     await this.pageDebug.captureDebug(page, 'password-filled');
 
     // Race two events for the next 60s — register BOTH before clicking submit,
@@ -432,19 +461,47 @@ export class AvitoAuthService {
 
   private requestCodeFromUser(reason: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      this.pendingCodeTimeout = setTimeout(() => {
         this.pendingCodeResolver = null;
+        this.pendingCodeTimeout = null;
         reject(
           new Error(`2FA code timeout (${TIMEOUTS_MS.twoFactorCodeWait / 60000} min)`),
         );
       }, TIMEOUTS_MS.twoFactorCodeWait);
 
       this.pendingCodeResolver = (code: string) => {
-        clearTimeout(timeout);
+        if (this.pendingCodeTimeout) {
+          clearTimeout(this.pendingCodeTimeout);
+          this.pendingCodeTimeout = null;
+        }
         resolve(code);
       };
 
       this.events.emit('auth.needs_code', { reason, at: new Date().toISOString() });
+    });
+  }
+
+  private requestCredentialsFromUser(
+    reason: string,
+  ): Promise<{ login: string; password: string }> {
+    return new Promise<{ login: string; password: string }>((resolve, reject) => {
+      this.pendingCredentialsTimeout = setTimeout(() => {
+        this.pendingCredentialsResolver = null;
+        this.pendingCredentialsTimeout = null;
+        reject(
+          new Error(`Credentials timeout (${TIMEOUTS_MS.credentialsWait / 60000} min)`),
+        );
+      }, TIMEOUTS_MS.credentialsWait);
+
+      this.pendingCredentialsResolver = (creds) => {
+        if (this.pendingCredentialsTimeout) {
+          clearTimeout(this.pendingCredentialsTimeout);
+          this.pendingCredentialsTimeout = null;
+        }
+        resolve(creds);
+      };
+
+      this.events.emit('auth.needs_credentials', { reason, at: new Date().toISOString() });
     });
   }
 

@@ -1,9 +1,12 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { CDPSession, Page } from 'puppeteer';
+import { readdir, rm } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 
 import { AppConfigService } from '../../config/config.service';
 import { AvitoAuthService } from './auth.service';
+import { BrowserService } from './browser.service';
 import type { AvitoMessage, StatusChange } from './avito.types';
 import { parseMessageFrame } from './message-frame.parser';
 import { PageDebugService } from './page-debug.service';
@@ -63,6 +66,14 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
   private startedAt = 0;
   private stopped = false;
   private restarting = false;
+  // Lifecycle of the user-driven flow within a single process:
+  //   idle    — not started yet, waiting for the first POST /control/start
+  //   running — auth + watcher are live (or in progress)
+  //   failed  — bring-up errored OR halt() fired during runtime; the next
+  //             POST /control/start resets per-session state and tries again
+  // Distinct from the StatusService snapshot — that exposes the auth state
+  // (logging_in / awaiting_code / authorized / error) for the UI.
+  private runState: 'idle' | 'running' | 'failed' = 'idle';
   private lastFrameAt = 0;
   private lastRefreshAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
@@ -71,13 +82,50 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly config: AppConfigService,
     private readonly auth: AvitoAuthService,
+    private readonly browserService: BrowserService,
     private readonly events: EventEmitter2,
     private readonly pageDebug: PageDebugService,
   ) {}
 
   async onModuleInit(): Promise<void> {
     this.config.validate();
+    // No auto-start. The watcher (and the auth flow it kicks off) only runs
+    // after the user explicitly hits Start in the UI — see startManual().
+    // Until then we stay in the default `idle` state from StatusService.
+  }
+
+  isStarted(): boolean {
+    return this.runState === 'running';
+  }
+
+  /**
+   * Called from the REST endpoint POST /control/start when the user clicks
+   * Start in the UI. Two valid entry points:
+   *   * runState === 'idle'   — first start after process boot
+   *   * runState === 'failed' — restart after a previous attempt errored
+   *                              (whether the error came from bring-up or
+   *                              from a mid-runtime halt()). We wipe the
+   *                              per-session residue from the failed attempt
+   *                              and re-run start() as if from scratch.
+   *
+   * Running → throws 400 to the caller; we never spawn parallel pipelines.
+   *
+   * Returns immediately — auth + watcher bring-up runs in the background and
+   * surfaces progress via status events.
+   */
+  startManual(): void {
+    if (this.runState === 'running') {
+      throw new Error('Watcher is already running');
+    }
+    if (this.runState === 'failed') {
+      this.logger.log('Restart requested by user after previous failure — resetting session');
+      this.resetSession();
+    } else {
+      this.logger.log('Watcher start requested by user');
+    }
+    this.runState = 'running';
     this.start().catch((err) => {
+      this.runState = 'failed';
       this.logger.error(`Chat watcher failed to start: ${(err as Error).message}`);
       this.events.emit('status.change', {
         state: 'error',
@@ -85,6 +133,97 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
         at: new Date().toISOString(),
       } satisfies StatusChange);
     });
+  }
+
+  /**
+   * Wipe the residue of a previous failed start so the next start() runs
+   * against a clean slate: clear stopped/restarting guards, dedup sets,
+   * pending message buffers, timing baselines, recovery counter; tear down
+   * any leftover page/CDP/monitor from the failed attempt; ask the auth
+   * service to drop pending code/credentials waits (their setTimeouts
+   * otherwise outlive this call and can clobber the new attempt's resolver).
+   *
+   * The browser process itself is intentionally NOT reset — keeping the
+   * Chrome session in userDataDir is the whole point of the volume.
+   */
+  private resetSession(): void {
+    this.stopped = false;
+    this.restarting = false;
+    this.seenMessageIds.clear();
+    this.targetChats.clear();
+    this.pendingByChannel.clear();
+    this.startedAt = 0;
+    this.lastFrameAt = 0;
+    this.lastRefreshAt = 0;
+    this.channelsListRecoveryAttempts = 0;
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer);
+      this.monitorTimer = null;
+    }
+    if (this.cdp) {
+      void this.cdp.detach().catch(() => undefined);
+      this.cdp = null;
+    }
+    if (this.page && !this.page.isClosed()) {
+      void this.page.close().catch(() => undefined);
+    }
+    this.page = null;
+    this.auth.resetPendingRequests();
+  }
+
+  /**
+   * Full nuclear reset: tear down the in-memory session, close the browser
+   * (releases file handles in userDataDir), and wipe the chrome-profile
+   * directory contents (cookies, login data, history, cache — everything).
+   * After this, runState is back to 'idle' and the next Start runs against
+   * a completely blank profile.
+   *
+   * Called from POST /control/reset. Allowed in any runState — if the
+   * watcher is currently running, we tear it down forcibly.
+   */
+  async fullReset(): Promise<void> {
+    this.logger.warn('Full reset requested — wiping browser session and chrome-profile');
+    // Mark stopped so any in-flight start()/restart() short-circuits its
+    // remaining guards once execution returns to user code.
+    this.stopped = true;
+    this.resetSession();
+    await this.browserService.close();
+    await this.wipeProfileContents();
+    this.runState = 'idle';
+    this.events.emit('status.change', {
+      state: 'idle',
+      detail: 'Профиль обнулён. Нажмите «Запустить» чтобы начать заново.',
+      at: new Date().toISOString(),
+    } satisfies StatusChange);
+  }
+
+  /**
+   * Delete every entry inside the chrome-profile dir but keep the directory
+   * itself — the dir is typically a docker volume mount point, which is
+   * busy and can't be removed (and we don't need to). Refuses to act on
+   * paths that look like system directories.
+   */
+  private async wipeProfileContents(): Promise<void> {
+    const resolved = resolve(this.config.userDataDir);
+    const RESERVED = new Set(['/', '/root', '/home', '/etc', '/var', '/usr', '/bin', '/sbin', '/tmp', '/app']);
+    if (RESERVED.has(resolved) || resolved.length < 5) {
+      throw new Error(`Refusing to wipe suspicious userDataDir path: ${resolved}`);
+    }
+    let entries: string[];
+    try {
+      entries = await readdir(resolved);
+    } catch (err) {
+      // Dir doesn't exist yet — nothing to wipe.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.logger.log(`Profile dir absent (${resolved}); nothing to wipe`);
+        return;
+      }
+      throw err;
+    }
+    this.logger.warn(`Wiping ${entries.length} entries from ${resolved}`);
+    await Promise.all(
+      entries.map((entry) => rm(join(resolved, entry), { recursive: true, force: true })),
+    );
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -102,14 +241,15 @@ export class ChatWatcherService implements OnModuleInit, OnModuleDestroy {
   /**
    * Hard-stop the watcher on any unrecoverable inconsistency: DOM contract
    * break, WS frame contract break, WS stall, page closed. Surfaces the reason
-   * to the operator and tears down resources. Restart the service after
-   * investigating the logs.
+   * to the operator, tears down resources, and flips runState to 'failed'
+   * so the next POST /control/start treats it as a restart.
    */
   private halt(reason: string): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.runState = 'failed';
 
-    const detail = `Avito watcher halted: ${reason}. Restart the service.`;
+    const detail = `Avito watcher halted: ${reason}. Click Start to retry.`;
     this.logger.error(detail);
     this.events.emit('status.change', {
       state: 'error',

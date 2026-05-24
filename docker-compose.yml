@@ -1,17 +1,46 @@
 services:
   avito-relay:
-    build: .
+    # Force amd64: google-chrome-stable from Google's apt repo ships amd64
+    # only. On Apple Silicon dev machines this runs under QEMU (slower);
+    # on prod amd64 hosts it's native.
+    platform: linux/amd64
+    build:
+      context: .
+      platforms:
+        - linux/amd64
     image: avito-relay
     container_name: avito-relay
     init: true
     ports:
-      - "3000:3000"
+      # HOST_PORT lets the deployment override the host-side bind without
+      # touching this file (e.g. when port 3000 is taken on the target host).
+      # Set HOST_PORT=3001 in .env on the remote; defaults to 3000 locally.
+      - "${HOST_PORT:-3000}:3000"
+      # ⚠ noVNC exposed on 0.0.0.0 with x11vnc running -nopw — anyone who
+      # reaches this port can fully control the in-container Chrome (read
+      # cookies, type credentials, navigate). Accept this risk only while
+      # the deploy is single-user / short-lived. Lock down later via:
+      #   * binding back to 127.0.0.1 + SSH tunnel for access, OR
+      #   * adding `-passwdfile /etc/x11vnc.pw` to entrypoint and a strong
+      #     password
+      #
+      # The raw VNC port 5900 is intentionally NOT published to the host —
+      # x11vnc still listens on 5900 inside the container so websockify can
+      # bridge it to noVNC at 6080, but the only access vector from outside
+      # is the noVNC web UI.
+      - "0.0.0.0:6080:6080"   # noVNC web UI → http://<host>:6080/vnc.html
     env_file:
       - .env
     environment:
-      PUPPETEER_HEADLESS: "true"
       PUPPETEER_USER_DATA_DIR: /app/.chrome-profile
-      PUPPETEER_EXECUTABLE_PATH: ""
+      # PUPPETEER_EXECUTABLE_PATH is set in the Dockerfile to point at
+      # /usr/bin/google-chrome-stable — do NOT override it here (an empty
+      # string would un-set the path and Chrome wouldn't launch).
+      TZ: Europe/Moscow
+      LANG: ru_RU.UTF-8
+      LANGUAGE: ru_RU:ru
+      LC_ALL: ru_RU.UTF-8
+      ENABLE_VNC: "true"
     volumes:
       - chrome-profile:/app/.chrome-profile
     restart: unless-stopped

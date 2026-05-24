@@ -16,6 +16,22 @@
       </div>
     </header>
 
+    <section id="start-panel" class="auth-panel hidden">
+      <p>Сервис не запущен. Перед началом нужно подтвердить старт.</p>
+      <button id="start-button" type="button">Запустить</button>
+      <p id="start-feedback" class="muted"></p>
+    </section>
+
+    <section id="credentials-panel" class="auth-panel hidden">
+      <p>Введите учётные данные Avito: <span id="credentials-reason" class="muted"></span></p>
+      <form id="credentials-form">
+        <input id="credentials-login" name="login" type="text" autocomplete="username" placeholder="+7 999 123-45-67 или email" required />
+        <input id="credentials-password" name="password" type="password" autocomplete="current-password" placeholder="пароль" required />
+        <button type="submit">Войти</button>
+      </form>
+      <p id="credentials-feedback" class="muted"></p>
+    </section>
+
     <section id="auth-panel" class="auth-panel hidden">
       <p>Avito requested a 2FA code: <span id="auth-reason"></span></p>
       <form id="auth-form">
@@ -29,6 +45,11 @@
       <ul id="messages" class="messages"></ul>
       <p id="empty-state" class="muted">Waiting for new messages…</p>
     </main>
+
+    <footer class="danger-zone">
+      <button id="reset-button" type="button" class="danger">Полный сброс</button>
+      <span id="reset-feedback" class="muted"></span>
+    </footer>
 
     <script src="/socket.io/socket.io.js"></script>
     <script src="/app.js"></script>

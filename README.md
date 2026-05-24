@@ -161,14 +161,13 @@ PUPPETEER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google 
 ```env
 PORT=3000
 
-AVITO_LOGIN=+7 999 123-45-67
-AVITO_PASSWORD=your-password
+# Логин и пароль Avito НЕ хранятся в .env. При первой авторизации (или
+# когда сессия в profile-volume инвалидирована) сервис эмитит
+# WS-событие `auth:needs_credentials`, фронт показывает форму, и пара
+# логин/пароль уходит в `POST /auth/credentials` ровно на одно использование.
 TARGET_USER_NAME=Рушан
 
-PUPPETEER_HEADLESS=false        # рекомендуется false при первом запуске
 PUPPETEER_USER_DATA_DIR=./.chrome-profile
-
-AUTH_MAX_ATTEMPTS=3
 
 DEBUG_SCREENSHOTS=false         # дампить скриншоты + HTML-снэпшоты в ./debug-screenshots/ при логине
 ```
@@ -187,19 +186,20 @@ npm run start:dev
 Откройте <http://localhost:3000>. На странице:
 
 - индикатор статуса вверху;
+- при первом запуске (и каждый раз когда сессия в `chrome-profile`
+  инвалидируется) появится форма ввода Avito-логина и пароля;
 - если Авито запросит SMS-код — появится поле ввода кода;
 - при появлении сообщений в целевом чате они мгновенно отрисуются.
 
-> **Совет на первый запуск:** оставьте `PUPPETEER_HEADLESS=false` и при
-> необходимости вручную пройдите CAPTCHA в открывшемся окне Chromium. После
-> этого сессия сохранится в `.chrome-profile`.
+> **Совет на первый запуск:** при необходимости вручную пройдите CAPTCHA в
+> открывшемся окне Chrome. После этого сессия сохранится в `.chrome-profile`.
 
 ### 4. Запуск без графической оболочки (Xvfb)
 
-`PUPPETEER_HEADLESS=true` Авито детектит даже со stealth-плагином и сразу
-блокирует устройство по фингерпринту (внутри 2FA-модалки появляется «Доступ
-закрыт», затем IP уходит в бан). На сервере без X-сервера запускайте Chromium
-в `headless=false` под виртуальным дисплеем Xvfb.
+Chrome всегда стартует в headful-режиме — headless даже со stealth-плагином
+детектится Авито и приводит к блокировке устройства по фингерпринту (внутри
+2FA-модалки появляется «Доступ закрыт», затем IP уходит в бан). На сервере
+без X-сервера оборачивайте запуск в `xvfb-run`.
 
 **Установка (Ubuntu/Debian):**
 
@@ -210,21 +210,22 @@ sudo apt-get install -y xvfb
 **Запуск:**
 
 ```bash
-# .env: PUPPETEER_HEADLESS=false
-xvfb-run -a --server-args="-screen 0 1366x850x24" npm run start:dev
+xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run start:dev
 ```
 
 Для production-бинаря:
 
 ```bash
-xvfb-run -a --server-args="-screen 0 1366x850x24" node dist/main.js
+xvfb-run -a --server-args="-screen 0 1920x1080x24" node dist/main.js
 ```
 
 Флаги:
 
 - `-a` — автоматический выбор свободного `:N` дисплея;
-- `-screen 0 1366x850x24` — размер совпадает с `defaultViewport` в
-  `BrowserService` (1366×850), глубина 24 бита.
+- `-screen 0 1920x1080x24` — размер совпадает с `--window-size` в
+  `BrowserService` (1920×1080), глубина 24 бита.
+
+В Docker про Xvfb думать не нужно — его поднимает `docker/entrypoint.sh`.
 
 Если Авито уже успел забанить устройство, перед запуском удалите профиль —
 там лежит device-cookie антифрода:
@@ -239,13 +240,38 @@ rm -rf ./.chrome-profile
 docker compose up --build
 ```
 
-> Образ основан на `ghcr.io/puppeteer/puppeteer`, который содержит готовый
-> Chromium. В Docker `PUPPETEER_HEADLESS=true` форсится в compose-файле.
-> Профиль Chromium живёт в named-volume `chrome-profile` (не на хосте) —
+> Образ собирается на `node:22-bookworm-slim` и тянет **`google-chrome-stable`**
+> из официального apt-репозитория Google (тот же бинарь, что у живых
+> Linux-десктоп-юзеров — с Widevine CDM, без отличий Chrome-for-Testing).
+> Контейнер запускает Chrome headful под Xvfb + openbox (см. `docker/entrypoint.sh`).
+> Профиль Chrome живёт в named-volume `chrome-profile` (не на хосте) —
 > сессия переживает `docker compose restart`/`down → up`. Локальный
 > `.chrome-profile` контейнером не используется. Первый запуск контейнера
 > = чистая сессия: сервис залогинится из `.env`, 2FA-код введёшь в форме
 > на `localhost:3000`. Дальше — сессия осядет в volume.
+
+### Подсматривать за Chrome в контейнере (VNC / noVNC)
+
+В compose по умолчанию выставлено `ENABLE_VNC: "true"`, и порты
+проброшены **только на 127.0.0.1**. Внутри контейнера entrypoint поднимает:
+
+- `x11vnc` → порт `5900`;
+- `websockify` + `novnc` → порт `6080` (веб-клиент).
+
+Варианты подключения с хоста:
+
+```
+# В браузере (проще всего):
+open http://localhost:6080/vnc.html
+
+# Любым VNC-клиентом (на macOS — встроенный Screen Sharing):
+open vnc://localhost:5900
+```
+
+Пароля нет — это безопасно ровно потому, что порт виден только с loopback
+хоста. Если потребуется заглушить VNC (например, для прод-стенда), убери
+переменную `ENABLE_VNC` или поставь её в `"false"` — порты внутри контейнера
+никто не слушает, и проброс становится холостым.
 
 ## Публикация через CloudPub
 
@@ -295,7 +321,7 @@ clo publish http 3000
 
 | Сценарий                          | Поведение сервиса                                                                                                          |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Неверный пароль / нет 2FA-кода    | До `AUTH_MAX_ATTEMPTS` попыток с backoff. Между попытками `state` остаётся `logging_in` (без мерцания на `error`), причина последней неудачи попадает в `detail` финального `status:error`. |
+| Неверный пароль / нет 2FA-кода    | Одна попытка. Любая ошибка (таймаут ввода credentials/кода, неудачная пост-логин проверка) → `state=error`, причина в `detail`. Нужен ручной перезапуск сервиса.                            |
 | Disconnect Chromium               | `BrowserService` подхватит на следующем запросе и перезапустится.                                                          |
 | Контракт Avito сломался (DOM / WS)| Watcher вызывает `halt()`, эмитит `status.change` с `state=error` и причиной в `detail`. Нужен перезапуск после починки.   |
 | WS-стрим встал (нет фреймов 90с+) | Health-monitor вызывает `halt()` с `WS stalled: …` — поднимается тем же путём, что и другие halt-причины.                  |

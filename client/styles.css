@@ -135,3 +135,33 @@ main {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+.danger-zone {
+  margin-top: auto;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+
+button.danger {
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--err);
+  color: var(--err);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button.danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.12);
+}
+
+button.danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

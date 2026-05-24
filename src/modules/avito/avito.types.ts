@@ -2,6 +2,7 @@ export type AuthState =
   | 'idle'
   | 'starting'
   | 'logging_in'
+  | 'awaiting_credentials'
   | 'awaiting_code'
   | 'authorized'
   | 'error';
@@ -22,6 +23,11 @@ export interface AvitoMessage {
 }
 
 export interface AuthCodeRequest {
+  reason: string;
+  at: string;
+}
+
+export interface AuthCredentialsRequest {
   reason: string;
   at: string;
 }
